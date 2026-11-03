@@ -9,7 +9,9 @@ from .footage import is_image
 from .tts import split_cues, word_cues
 from .util import run
 
-REAL_TRANSITIONS = ["fade", "dissolve", "wipeleft", "slideleft", "circleopen", "smoothleft"]
+# "dissolve" gốc của ffmpeg là hòa bằng hạt nhiễu lấm tấm -> dùng "fade" (hòa mờ mượt) thay thế
+XFADE = {"dissolve": "fade"}
+REAL_TRANSITIONS = ["fade", "fadeblack", "smoothleft", "slideleft", "circleopen", "wipeleft"]
 
 
 def _ass_time(t):
@@ -92,7 +94,8 @@ def plan_segments(timeline, picker, max_clip, trans):
             else:
                 loop = cdur < need + 0.2
                 start = 0 if loop else (random.uniform(0, max(0, cdur - need - 0.1)) if picker.mode == "random" else 0)
-                segs.append({"path": str(path), "start": round(start, 2), "dur": round(d, 3), "loop": loop})
+                segs.append({"path": str(path), "start": round(start, 2), "dur": round(d, 3), "loop": loop,
+                             "cdur": round(cdur, 3) if cdur < 1e5 else 0})
     return segs
 
 
@@ -113,8 +116,26 @@ def pinned_segments(files, media_dir: Path, total, trans):
         except Exception:
             cdur = 0
         loop = cdur < d + trans + 0.2
-        segs.append({"path": str(p), "start": 0, "dur": round(d, 3), "loop": loop})
+        segs.append({"path": str(p), "start": 0, "dur": round(d, 3), "loop": loop, "cdur": round(cdur, 3)})
     return segs
+
+
+def tail_head(prev_segs, t):
+    """Đoạn mở đầu của cảnh sau = phần TIẾP THEO của clip cuối cảnh trước (dài t giây, dur=0).
+    Cảnh sau hòa từ đoạn này sang clip của nó -> chỗ nối giữa 2 cảnh thành chuyển cảnh liền mạch."""
+    last, idx = prev_segs[-1], len(prev_segs) - 1
+    head = {"path": last["path"], "start": 0, "dur": 0, "loop": False, "head": True}
+    if last["path"] is None:
+        return head
+    if is_image(last["path"]):   # Ken Burns cảnh trước kết thúc ở mức zoom này
+        head["zoom"] = 1.12 if idx % 2 == 0 else 1.0
+        return head
+    pos, cdur = last["start"] + last["dur"], last.get("cdur") or 0
+    if last["loop"] or not cdur or pos + t + 0.1 > cdur:
+        head["loop"] = True   # clip đã hết/vòng lặp: lặp lại từ đầu (hiếm)
+    else:
+        head["start"] = round(pos, 3)
+    return head
 
 
 def _ken_burns(w, h, dur, fps, i):
@@ -126,11 +147,18 @@ def _ken_burns(w, h, dur, fps, i):
             f"zoompan=z='{z}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}")
 
 
-def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st: Settings, fps=30, threads=0):
+def _still_zoom(w, h, z, fps):
+    return (f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2},"
+            f"zoompan=z='{z}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}")
+
+
+def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st: Settings, fps=30, threads=0,
+                 fade_in=0.0, fade_out=0.0):
+    """segs[0] có thể là đoạn nối từ cảnh trước (head=True, dur=0): chỉ dùng cho hiệu ứng chuyển."""
     n = len(segs)
     t = st.transition_dur if (st.transition != "none" and n > 1) else 0.0
     if t:
-        t = min(t, 0.4 * min(s["dur"] for s in segs))
+        t = min(t, 0.4 * min(s["dur"] for s in segs if not s.get("head")))
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     chains = []
     for i, sg in enumerate(segs):
@@ -139,6 +167,10 @@ def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st
             cmd += ["-f", "lavfi", "-t", f"{dur:.3f}", "-i", f"color=c=0x101828:s={w}x{h}:r={fps}"]
         elif is_image(sg["path"]):
             cmd += ["-loop", "1", "-framerate", str(fps), "-t", f"{dur:.3f}", "-i", sg["path"]]
+            if sg.get("zoom"):   # đoạn nối: giữ nguyên mức zoom cuối của cảnh trước
+                chains.append(f"[{i}:v]{_still_zoom(w, h, sg['zoom'], fps)},setsar=1,format=yuv420p,"
+                              f"setpts=PTS-STARTPTS[v{i}]")
+                continue
             chains.append(f"[{i}:v]{_ken_burns(w, h, dur, fps, i)},setsar=1,format=yuv420p,"
                           f"setpts=PTS-STARTPTS[v{i}]")
             continue
@@ -154,7 +186,7 @@ def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st
         parts, prev, acc = [], "v0", 0.0
         for i in range(1, n):
             acc += segs[i - 1]["dur"]
-            name = random.choice(REAL_TRANSITIONS) if st.transition == "random" else st.transition
+            name = random.choice(REAL_TRANSITIONS) if st.transition == "random" else XFADE.get(st.transition, st.transition)
             parts.append(f"[{prev}][v{i}]xfade=transition={name}:duration={t:.3f}:offset={acc:.3f}[x{i}]")
             prev = f"x{i}"
         join = ";".join(parts) + f";[{prev}]null[vc]"
@@ -163,6 +195,10 @@ def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st
     # Ép đầu ra về yuv420p dải tv: ảnh JPEG/footage 4:4:4 nếu lọt qua sẽ thành H.264 High 4:4:4,
     # trình duyệt không phát được và ghép -c copy với cảnh 4:2:0 làm video đứt giữa chừng.
     fix = "scale=out_range=tv,format=yuv420p"
+    if fade_in:    # đầu video: hiện dần từ màn đen
+        fix = f"fade=t=in:d={fade_in:.2f}," + fix
+    if fade_out:   # cuối video: tối dần
+        fix = f"fade=t=out:st={max(0.0, total - fade_out):.3f}:d={fade_out:.2f}," + fix
     last = f"[vc]ass={ass.name},{fix}[vo]" if ass else f"[vc]{fix}[vo]"
     vol = f"volume={st.voice_volume / 100:.2f}," if st.voice_volume != 100 else ""
     cmd += ["-i", str(audio), "-filter_complex", ";".join(chains + [join, last]),

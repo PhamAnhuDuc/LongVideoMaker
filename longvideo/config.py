@@ -67,7 +67,10 @@ LANG_NAME = {"vi": "Tiếng Việt", "en": "English"}
 
 
 SOURCES = ["pexels", "pixabay", "local"]
-TRANSITIONS = ["none", "fade", "dissolve", "wipeleft", "slideleft", "circleopen", "smoothleft", "random"]
+TRANSITIONS = ["none", "fade", "fadeblack", "smoothleft", "slideleft", "circleopen", "wipeleft", "random"]
+TRANSITION_NAMES = {"none": "Không (cắt thẳng)", "fade": "Hòa mờ (mượt nhất)", "dissolve": "Hòa mờ (mượt nhất)",
+                    "fadeblack": "Mờ qua màn đen", "smoothleft": "Trượt mềm sang trái", "slideleft": "Đẩy sang trái",
+                    "circleopen": "Mở vòng tròn", "wipeleft": "Gạt sang trái", "random": "Ngẫu nhiên"}
 MUSIC_DIR = ROOT / "assets" / "music"
 MUSIC_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -90,6 +93,7 @@ class Settings:
     aspect: str = "16:9"            # 16:9 | 9:16
     height: int = 720               # chiều cao video ngang (720/1080)
     footage_sources: list = field(default_factory=lambda: ["pixabay"])
+    media_mode: str = "auto"        # auto: cảnh đã chèn dùng file của tôi, còn lại tự tìm | mine: chỉ dùng file của tôi
     clip_mode: str = "random"       # random | sequential
     max_clip_sec: float = 7.0       # độ dài tối đa mỗi clip
     transition: str = "fade"

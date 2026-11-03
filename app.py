@@ -11,7 +11,7 @@ import streamlit as st
 
 from longvideo import music
 from longvideo.compose import preview_subtitle
-from longvideo.config import (CACHE, LANG_NAME, PROJECTS, ROOT, SOURCES, TRANSITIONS, VOICES, WORDS_PER_MIN, voice_label,
+from longvideo.config import (CACHE, LANG_NAME, PROJECTS, ROOT, SOURCES, TRANSITION_NAMES, TRANSITIONS, VOICES, WORDS_PER_MIN, voice_label,
                               Settings, save_env)
 from longvideo.footage import is_image, local_clips
 from longvideo.pipeline import Project, list_projects
@@ -132,7 +132,8 @@ def media_library(p, key):
             files = local_clips(p.media)
         if files:
             st.caption("Ảnh được tự thêm hiệu ứng zoom chậm. Dùng ô **📎 Chèn ảnh/video** ở từng cảnh để đặt "
-                       "đúng chỗ, hoặc bật nguồn footage **Ảnh/video tự nhập** (tab cài đặt) để app tự rải vào.")
+                       "đúng chỗ (cảnh không chèn thì hệ thống tự tìm footage), hoặc chọn **Chỉ dùng ảnh/video "
+                       "của tôi cho toàn bộ video** ở tab 2️⃣ mục Hình ảnh.")
             cols = st.columns(6)
             for i, f in enumerate(files):
                 c = cols[i % 6]
@@ -209,15 +210,30 @@ with tab2:
                       horizontal=True)
     height = c1.radio("Độ phân giải", [720, 1080], index=[720, 1080].index(settings.height), horizontal=True,
                       format_func=lambda x: f"{x}p")
-    sources = c2.multiselect("Nguồn footage", SOURCES, default=[x for x in settings.footage_sources if x in SOURCES],
-                             format_func={"pexels": "Pexels", "pixabay": "Pixabay", "local": "Ảnh/video tự nhập"}.get)
+    media_mode = c2.radio(
+        "Nguồn hình cho video", ["auto", "mine"], index=1 if settings.media_mode == "mine" else 0,
+        format_func={"auto": "Tự động: cảnh nào tôi chèn ảnh/video thì dùng, còn lại hệ thống tự tìm",
+                     "mine": "Chỉ dùng ảnh/video của tôi cho toàn bộ video"}.get)
+    sources = settings.footage_sources
+    if media_mode == "auto":
+        sources = c2.multiselect("Nguồn footage tự tìm", SOURCES,
+                                 default=[x for x in settings.footage_sources if x in SOURCES],
+                                 format_func={"pexels": "Pexels", "pixabay": "Pixabay",
+                                              "local": "Ảnh/video của tôi chưa chèn vào cảnh nào (rải ngẫu nhiên)"}.get)
+    else:
+        n_media = len(local_clips(proj.media)) if proj else 0
+        (c2.caption if n_media else c2.warning)(
+            f"Toàn bộ video lấy từ {n_media} ảnh/video của bạn (cảnh có chèn riêng thì dùng đúng file đó). "
+            + ("" if n_media else "Chưa có file nào: tải lên ở mục 📁 Ảnh & video của bạn bên dưới."))
     clip_mode = c2.radio("Cách chọn clip", ["random", "sequential"], horizontal=True,
                          index=["random", "sequential"].index(settings.clip_mode),
                          format_func={"random": "Ngẫu nhiên", "sequential": "Lần lượt"}.get)
     c3, c4, c5 = st.columns(3)
     max_clip = c3.slider("Độ dài tối đa mỗi clip (giây)", 3.0, 15.0, float(settings.max_clip_sec), 0.5)
-    transition = c4.selectbox("Chuyển cảnh", TRANSITIONS,
-                              index=TRANSITIONS.index(settings.transition) if settings.transition in TRANSITIONS else 0)
+    cur_tr = "fade" if settings.transition == "dissolve" else settings.transition   # dissolve cũ = hòa mờ
+    transition = c4.selectbox("Chuyển cảnh", TRANSITIONS, format_func=TRANSITION_NAMES.get,
+                              index=TRANSITIONS.index(cur_tr) if cur_tr in TRANSITIONS else 0,
+                              help="Áp dụng cả giữa các clip trong cảnh lẫn giữa hai cảnh liền nhau.")
     trans_dur = c5.slider("Thời lượng chuyển cảnh (s)", 0.2, 1.5, float(settings.transition_dur), 0.1,
                           disabled=transition == "none")
 
@@ -257,7 +273,7 @@ with tab2:
 
     cur = Settings(topic=topic, language=lang, minutes=minutes, tone=tone, audience=audience, notes=notes,
                    gemini_model=model, voice=voice, rate=rate, voice_style=voice_style, voice_volume=voice_volume, aspect=aspect,
-                   height=height, footage_sources=sources, clip_mode=clip_mode, max_clip_sec=max_clip,
+                   height=height, footage_sources=sources, media_mode=media_mode, clip_mode=clip_mode, max_clip_sec=max_clip,
                    transition=transition, transition_dur=trans_dur, subtitles=subs, sub_timing=sub_timing,
                    whisper_model=whisper_model, sub_font=sub_font, sub_bold=sub_bold, sub_color=sub_color,
                    sub_outline_color=sub_outline_color, sub_size=sub_size, sub_outline=sub_outline,
@@ -295,7 +311,7 @@ with tab2:
         st.info("Hãy nhập chủ đề rồi bấm **Tạo kịch bản** (hoặc dán kịch bản) ở tab 1 để tạo dự án, "
                 "sau đó quay lại đây tải video/nhạc lên.")
     else:
-        if "local" in sources:
+        if "local" in sources or media_mode == "mine":
             media_library(proj, "lib2")
         if bgm_mode == "upload":
             bg = st.file_uploader("Nhạc nền của bạn", type=["mp3", "wav", "m4a", "ogg"])

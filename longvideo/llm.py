@@ -11,10 +11,12 @@ from .config import LANG_NAME, WORDS_PER_MIN, Settings
 
 def _client():
     from google import genai
+    from google.genai import types
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("Thiếu GEMINI_API_KEY (nhập ở thanh bên hoặc file .env).")
-    return genai.Client(api_key=key)
+    # giới hạn 90s/lần gọi: model quá tải đôi khi treo rất lâu -> hết giờ thì thử lại / đổi model
+    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=90_000))
 
 
 def _parse_json(text: str):
@@ -217,6 +219,7 @@ def make_keywords(s: Settings, project: dict, progress=None):
     todo = [(ci, si) for ci, c in enumerate(project["chapters"]) for si, x in enumerate(c["scenes"])
             if not x.get("shots") or not all(sh.get("kw") for sh in x["shots"])]
     batch_size = 10
+    errors = []
     for b in range(0, len(todo), batch_size):
         batch = todo[b:b + batch_size]
         items, shot_lists = [], []
@@ -232,7 +235,8 @@ Trả về JSON: {{"shots": {{"0.0": ["...", "..."], "0.1": [...], ...}}, "scene
 Phải có đủ mọi khóa câu ở trên."""
         try:
             out = ask_json(prompt, s.gemini_model, temperature=0.4)
-        except Exception:
+        except Exception as e:
+            errors.append(e)
             out = {}
         got_shots, got_scenes = out.get("shots") or {}, out.get("scenes") or {}
         for k, (ci, si) in enumerate(batch):
@@ -243,3 +247,6 @@ Phải có đủ mọi khóa câu ở trên."""
             sc["keywords"] = general or next((x["kw"][-1:] for x in sc["shots"] if x["kw"]), []) or [project["title"]]
         if progress:
             progress(min(1.0, (b + len(batch)) / max(1, len(todo))), f"Từ khóa {b + len(batch)}/{len(todo)}")
+    if errors:   # vẫn giữ phần đã làm được, nhưng báo cho người dùng biết để bấm tạo lại / sửa tay
+        return f"Gemini lỗi ở {len(errors)} lượt tạo từ khóa: {errors[-1]}"
+    return None

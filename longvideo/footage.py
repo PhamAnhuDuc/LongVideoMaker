@@ -16,6 +16,15 @@ _lock = threading.Lock()
 _search_cache: dict = {}
 
 
+# dùng khi mọi từ khóa của câu đều không ra clip (vd từ khóa quá lạ) -> vẫn có hình thay vì khung tối
+GENERIC_KW = ["nature landscape", "sky clouds", "sunset", "forest", "ocean waves", "city aerial"]
+
+
+def _is_vi(q: str) -> bool:
+    """Từ khóa có chữ ngoài ASCII (tiếng Việt có dấu) -> tìm bằng tiếng Việt."""
+    return any(ord(c) > 127 for c in q)
+
+
 def is_image(p) -> bool:
     return Path(p).suffix.lower() in IMAGE_EXT
 
@@ -72,7 +81,7 @@ def pexels_search(query, portrait=False):
     if not key:
         return []
     data = _get("https://api.pexels.com/videos/search", headers={"Authorization": key},
-                params={"query": query, "per_page": 20,
+                params={"query": query, "per_page": 20, "locale": "vi-VN" if _is_vi(query) else "en-US",
                         "orientation": "portrait" if portrait else "landscape"})
     out = []
     for v in data.get("videos", []):
@@ -89,6 +98,7 @@ def pixabay_search(query, portrait=False):
     if not key:
         return []
     data = _get("https://pixabay.com/api/videos/", params={"key": key, "q": query[:100], "per_page": 20,
+                                                            "lang": "vi" if _is_vi(query) else "en",
                                                             "safesearch": "true"})
     out = []
     for h in data.get("hits", []):
@@ -96,7 +106,9 @@ def pixabay_search(query, portrait=False):
                  if f.get("url") and f.get("width")]
         if files and h.get("duration", 0) >= 3:
             out.append({"id": f"pixabay{h['id']}", "files": files})
-    return out
+    # Pixabay không lọc chiều được -> ưu tiên clip đúng chiều khung hình (ngang/dọc), thiếu thì mới lấy clip lệch chiều
+    same = [v for v in out if (v["files"][0][1] > v["files"][0][0]) == portrait]
+    return same if len(same) >= 3 else same + [v for v in out if v not in same]
 
 
 def _best_file(files, target_w, portrait):
@@ -111,9 +123,11 @@ SEARCH = {"pexels": pexels_search, "pixabay": pixabay_search}
 class FootagePicker:
     """Chọn clip cho từng đoạn. mode = random | sequential; tránh lặp trong cùng một video."""
 
-    def __init__(self, media_dir: Path, sources, portrait, target_w, mode="random"):
+    def __init__(self, media_dir: Path, sources, portrait, target_w, mode="random", exclude=()):
+        """exclude: tên file đã chèn riêng cho cảnh nào đó -> không rải sang cảnh khác."""
         self.portrait, self.target_w, self.mode = portrait, target_w, mode
-        self.locals = local_clips(media_dir) if "local" in sources else []
+        skip = set(exclude)
+        self.locals = [p for p in local_clips(media_dir) if p.name not in skip] if "local" in sources else []
         self.sources = [s for s in sources if s != "local" or self.locals]
         self.used: set[str] = set()
         self.durs: dict[str, float] = {}
@@ -208,4 +222,6 @@ class FootagePicker:
                     p = _download(link, CACHE / src / f"{v['id']}_{w}x{h}.mp4")
                     if p:
                         return self._take(p, v["id"])
+        if not any(k in GENERIC_KW for k in kws):   # cuối cùng: hình chung chung còn hơn khung tối
+            return self.pick(GENERIC_KW)
         return None, 0

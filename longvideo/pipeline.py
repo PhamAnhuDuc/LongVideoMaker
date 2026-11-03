@@ -8,9 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import llm, music
-from .compose import concat_scenes, pinned_segments, plan_segments, render_scene, scene_cues, write_ass
+from .compose import (concat_scenes, pinned_segments, plan_segments, render_scene, scene_cues,
+                      tail_head, write_ass)
 from .config import PROJECTS, Settings
-from .footage import FootagePicker
+from .footage import FootagePicker, local_clips
 from .shots import shots_for, timeline
 from .tts import clean_text, gemini_chapter, is_gemini, proportional, synth, whisper_word_times
 from .util import fmt_ts, read_json, write_json
@@ -87,8 +88,11 @@ def generate_script(proj: Project, progress):
 
 def generate_keywords(proj: Project, progress):
     s, script = proj.load()
-    llm.make_keywords(s, script, lambda f, m: progress(f, m))
+    err = llm.make_keywords(s, script, lambda f, m: progress(f, m))
     proj.save(s, script)
+    if err:
+        raise RuntimeError(err + " — Các cảnh thiếu từ khóa tạm dùng tiêu đề/chủ đề. Hãy bấm 🎯 Tạo từ khóa "
+                                 "theo câu để thử lại (hoặc đổi model Gemini), hoặc gõ từ khóa tay.")
     progress(1.0, "Đã tạo từ khóa footage.")
 
 
@@ -100,12 +104,12 @@ def run_full(proj: Project, progress):
     render(proj, lambda f, m: progress(0.3 + f * 0.7, m))
 
 
-def _scene_hash(s: Settings, sc, w, h):
+def _scene_hash(s: Settings, sc, w, h, pool=()):
     style = (s.subtitles, s.sub_font, s.sub_bold, s.sub_color, s.sub_outline_color, s.sub_size, s.sub_outline,
              s.sub_position, s.sub_margin, s.transition, s.transition_dur, s.max_clip_sec, s.clip_mode,
-             s.voice_volume, tuple(s.footage_sources), s.sub_timing)
+             s.voice_volume, tuple(s.footage_sources), s.sub_timing, s.media_mode, pool)
     shots = json.dumps([x["kw"] for x in shots_for(sc)], ensure_ascii=False)
-    key = f"v2|{sc['narration']}|{sc.get('keywords')}|{shots}|{sc.get('media')}|{s.voice}|{s.rate}|{w}x{h}|{style}"
+    key = f"v4|{sc['narration']}|{sc.get('keywords')}|{shots}|{sc.get('media')}|{s.voice}|{s.rate}|{w}x{h}|{style}"
     return hashlib.md5(key.encode()).hexdigest()
 
 
@@ -115,12 +119,27 @@ def render(proj: Project, progress):
         raise RuntimeError("Chưa có kịch bản.")
     w, h = s.size()
     portrait = h > w
-    picker = FootagePicker(proj.media, s.footage_sources, portrait, h if portrait else w, s.clip_mode)
     scenes = []
     for ci, ch in enumerate(script["chapters"]):
         for si, sc in enumerate(ch["scenes"]):
             scenes.append((ci, si, sc, proj.work / f"c{ci+1:02d}_s{si+1:03d}"))
     total = len(scenes)
+    pinned = sorted({f for _, _, sc, _ in scenes for f in (sc.get("media") or [])})
+    if s.media_mode == "mine":   # toàn bộ video chỉ dùng ảnh/video người dùng tải lên
+        if not local_clips(proj.media):
+            raise RuntimeError("Đang chọn 'Chỉ dùng ảnh/video của tôi' nhưng dự án chưa có ảnh/video nào. "
+                               "Hãy tải file lên ở mục 📁 Ảnh & video của bạn, hoặc chuyển về chế độ Tự động.")
+        picker = FootagePicker(proj.media, ["local"], portrait, h if portrait else w, s.clip_mode)
+        pool_key = ()
+    else:
+        # Tự động: file đã chèn cho cảnh nào chỉ dùng ở cảnh đó; các cảnh còn lại tự tìm footage
+        picker = FootagePicker(proj.media, s.footage_sources, portrait, h if portrait else w, s.clip_mode,
+                               exclude=pinned)
+        pool_key = tuple(pinned)
+        unpinned = [sc for _, _, sc, _ in scenes if not sc.get("media")]
+        if unpinned and not picker.sources:
+            raise RuntimeError("Có cảnh chưa chèn ảnh/video nhưng chưa bật nguồn tự tìm nào (Pixabay/Pexels). "
+                               "Hãy chọn nguồn footage ở tab 2️⃣ mục Hình ảnh.")
 
     # Pha 1: giọng đọc (song song) + mốc thời gian từ - bỏ qua cảnh đã làm
     gem = is_gemini(s.voice)
@@ -197,33 +216,70 @@ def render(proj: Project, progress):
         files.append(d / "scene.mp4")
         t += metas[d.name]["dur"] + 0.35
 
-    def scene_job(item):
+    t_eff = s.transition_dur if s.transition != "none" else 0.0
+
+    def plan_job(item):
+        """Chọn clip cho cảnh (tải footage). Lưu lại để cảnh sau biết clip cuối mà nối tiếp."""
         ci, si, sc, d = item
         sdur = metas[d.name]["dur"] + 0.35
-        out = d / "scene.mp4"
-        hsh = _scene_hash(s, sc, w, h)
+        base = _scene_hash(s, sc, w, h, pool_key)
         meta = read_json(d / "meta.json", {})
-        if out.exists() and meta.get("render_hash") == hsh:
-            return
-        t_eff = s.transition_dur if s.transition != "none" else 0.0
+        if meta.get("plan_hash") == base and meta.get("segs"):
+            return d.name, meta["segs"]
         segs = None
         if sc.get("media"):   # ảnh/video người dùng chọn riêng cho cảnh này
             segs = pinned_segments(sc["media"], proj.media, sdur, t_eff)
         if not segs:
             segs = plan_segments(timeline(sc, metas[d.name], sdur), picker, s.max_clip_sec, t_eff)
+        meta.update(plan_hash=base, segs=segs)
+        write_json(d / "meta.json", meta)
+        return d.name, segs
+
+    plans = {}
+    with ThreadPoolExecutor(6) as ex:   # chủ yếu chờ mạng tải footage
+        futs = [ex.submit(plan_job, it) for it in scenes]
+        for k, f in enumerate(as_completed(futs)):
+            name, segs = f.result()
+            plans[name] = segs
+            progress(0.25 + 0.15 * (k + 1) / total, f"Tìm footage {k+1}/{total}")
+
+    def rendered_segs(k):
+        """Danh sách đoạn thực sự dựng cho cảnh k: thêm đoạn nối từ cảnh trước nếu có chuyển cảnh."""
+        segs = plans[scenes[k][3].name]
+        if k == 0 or not t_eff:
+            return segs
+        return [tail_head(rendered_segs_plain(k - 1), t_eff)] + segs
+
+    def rendered_segs_plain(k):
+        # cảnh trước cũng có đoạn nối ở đầu -> chỉ số (chẵn/lẻ zoom ảnh) của đoạn cuối lệch 1
+        segs = plans[scenes[k][3].name]
+        return ([None] if k > 0 and t_eff else []) + segs
+
+    def scene_job(k):
+        ci, si, sc, d = scenes[k]
+        sdur = metas[d.name]["dur"] + 0.35
+        out = d / "scene.mp4"
+        segs = rendered_segs(k)
+        f_in = 0.8 if k == 0 else 0.0
+        f_out = 1.0 if k == total - 1 else 0.0
+        hsh = hashlib.md5(f"{_scene_hash(s, sc, w, h, pool_key)}|{json.dumps(segs)}|{f_in}|{f_out}".encode()).hexdigest()
+        meta = read_json(d / "meta.json", {})
+        if out.exists() and meta.get("render_hash") == hsh:
+            return
         ass = None
         if s.subtitles:
             ass = d / "sub.ass"
             write_ass(scene_cues(metas[d.name], portrait), ass, w, h, s)
-        render_scene(segs, d / "voice.mp3", ass, out, w, h, sdur, s, threads=SCENE_THREADS)
+        render_scene(segs, d / "voice.mp3", ass, out, w, h, sdur, s, threads=SCENE_THREADS,
+                     fade_in=f_in, fade_out=f_out)
         meta["render_hash"] = hsh
         write_json(d / "meta.json", meta)
 
     with ThreadPoolExecutor(SCENE_WORKERS) as ex:
-        futs = [ex.submit(scene_job, it) for it in scenes]
+        futs = [ex.submit(scene_job, k) for k in range(total)]
         for k, f in enumerate(as_completed(futs)):
             f.result()
-            progress(0.25 + 0.70 * (k + 1) / total, f"Dựng cảnh {k+1}/{total}")
+            progress(0.40 + 0.55 * (k + 1) / total, f"Dựng cảnh {k+1}/{total}")
 
     progress(0.96, "Ghép video cuối…")
     bgm = music.pick(s.bgm_mode, s.bgm_track, proj.bgm)
