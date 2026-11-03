@@ -160,8 +160,11 @@ def render(proj: Project, progress):
 
     if s.sub_timing != "sentence" and s.subtitles:
         progress(0.0, "Nạp model Whisper (lần đầu sẽ tải về, hơi lâu)…")
-        from . import align
-        align.preload(s.whisper_model)
+        try:
+            from . import align
+            align.preload(s.whisper_model)
+        except Exception as e:   # thiếu thư viện / không tải được model -> vẫn render, phụ đề theo câu
+            print("Không nạp được Whisper, dùng phụ đề theo câu:", e, flush=True)
     if gem:  # mỗi chương một lần gọi Gemini; xong thì tts_job bên dưới chỉ đọc lại meta đã lưu
         n_ch = len(script["chapters"])
         progress(0.0, f"Giọng Gemini: đọc {n_ch} chương…")

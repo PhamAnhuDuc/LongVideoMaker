@@ -41,22 +41,29 @@ def _get(url, **kw):
     return {}
 
 
+_dl_locks: dict = {}
+
+
 def _download(link, dest: Path) -> Path | None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() and dest.stat().st_size > 10_000:
-        return dest
-    tmp = dest.with_suffix(".part")
-    try:
-        with requests.get(link, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(tmp, "wb") as fh:
-                for chunk in r.iter_content(1 << 20):
-                    fh.write(chunk)
-        tmp.replace(dest)
-        return dest
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        return None
+    # các cảnh dựng song song có thể cùng cần 1 clip -> mỗi file chỉ một luồng tải, luồng kia chờ rồi dùng chung
+    with _lock:
+        lk = _dl_locks.setdefault(str(dest), threading.Lock())
+    with lk:
+        if dest.exists() and dest.stat().st_size > 10_000:
+            return dest
+        tmp = dest.with_suffix(".part")
+        try:
+            with requests.get(link, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as fh:
+                    for chunk in r.iter_content(1 << 20):
+                        fh.write(chunk)
+            tmp.replace(dest)
+            return dest
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            return None
 
 
 # ---------- Pexels ----------
@@ -177,8 +184,10 @@ class FootagePicker:
                 self.rr += 1
             else:
                 order = random.sample(self.sources, len(self.sources))
-            if order[0] == "local":  # lượt này dùng video tự nhập
-                return self._take(self._local(), None)
+            local_pick = self._local() if order[0] == "local" else None
+        # _take tự khóa _lock -> phải gọi NGOÀI khối with (Lock không cho khóa lồng -> treo)
+        if order[0] == "local":  # lượt này dùng ảnh/video tự nhập
+            return self._take(local_pick, None)
         remote = [x for x in order if x != "local"]
         kws = [k for k in keywords if k and k.strip()]
         for kw in kws:
@@ -187,7 +196,9 @@ class FootagePicker:
                 if p:
                     return self._take(p, vid)
         if "local" in order:
-            return self._take(self._local(), None)
+            with _lock:
+                p = self._local()
+            return self._take(p, None)
         # hết clip mới: chấp nhận dùng lại clip đã dùng của từ khóa cụ thể nhất
         for kw in kws:
             for src in remote:

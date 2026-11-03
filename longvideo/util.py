@@ -7,10 +7,32 @@ from pathlib import Path
 
 
 def run(cmd, cwd=None):
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    # utf-8 + replace: tên file tiếng Việt trong thông báo lỗi ffmpeg không làm vỡ việc đọc kết quả trên Windows
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         raise RuntimeError(f"{cmd[0]} lỗi:\n{r.stderr[-1500:]}")
     return r.stdout
+
+
+def pid_alive(pid) -> bool:
+    """Tiến trình còn chạy không (an toàn trên Windows: KHÔNG dùng os.kill(pid, 0) vì nó giết tiến trình)."""
+    if not pid:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259   # STILL_ACTIVE
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
 
 
 def duration(path) -> float:

@@ -18,7 +18,7 @@ from longvideo.pipeline import Project, list_projects
 from longvideo.script_parse import parse_script
 from longvideo.shots import shots_for
 from longvideo.tts import synth
-from longvideo.util import fmt_ts, read_json
+from longvideo.util import fmt_ts, pid_alive, read_json
 
 st.set_page_config(page_title="Long Video Maker", page_icon="🎬", layout="wide")
 
@@ -105,6 +105,48 @@ def start_job(p: Project, job: str):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     from longvideo.util import write_json
     write_json(p.dir / "status.json", {"job": job, "state": "running", "frac": 0, "msg": "Khởi động…", "pid": proc.pid})
+
+
+MEDIA_TYPES = ["jpg", "jpeg", "png", "webp", "bmp", "mp4", "mov", "mkv", "webm"]
+
+
+def media_library(p, key):
+    """Khung tải ảnh/video vào dự án + danh sách file (xóa được). Trả về tên các file hiện có."""
+    files = local_clips(p.media)
+    with st.expander(f"📁 Ảnh & video của bạn ({len(files)} file)", expanded=not files):
+        ups = st.file_uploader("Tải ảnh/video lên dự án (chọn được nhiều file)", type=MEDIA_TYPES,
+                               accept_multiple_files=True, key=f"up_{key}")
+        added = False
+        done = st.session_state.setdefault("_saved_uploads", set())
+        for u in ups or []:
+            # ô tải lên vẫn giữ file sau khi lưu -> nhớ file đã lưu để nút Xóa không bị ghi lại
+            uid = (p.name, u.file_id)
+            if uid in done:
+                continue
+            done.add(uid)
+            dest = p.media / u.name
+            if not dest.exists():
+                dest.write_bytes(u.getbuffer())
+                added = True
+        if added:
+            files = local_clips(p.media)
+        if files:
+            st.caption("Ảnh được tự thêm hiệu ứng zoom chậm. Dùng ô **📎 Chèn ảnh/video** ở từng cảnh để đặt "
+                       "đúng chỗ, hoặc bật nguồn footage **Ảnh/video tự nhập** (tab cài đặt) để app tự rải vào.")
+            cols = st.columns(6)
+            for i, f in enumerate(files):
+                c = cols[i % 6]
+                if is_image(f):
+                    c.image(str(f), width="stretch")
+                else:
+                    c.markdown("🎬")
+                c.caption(f.name)
+                if c.button("🗑️ Xóa", key=f"del_{key}_{f.name}"):
+                    f.unlink(missing_ok=True)
+                    st.rerun()
+        else:
+            st.caption("Chưa có file nào.")
+    return [f.name for f in files]
 
 
 st.title("🎬 Long Video Maker")
@@ -268,10 +310,31 @@ with tab2:
             st.success("Đã lưu")
 
 # ---------- Trạng thái tác vụ nền ----------
+def job_running(p: Project) -> bool:
+    """Dự án đang có tác vụ nền thật sự chạy (status 'running' VÀ tiến trình còn sống)."""
+    if not p:
+        return False
+    stt = read_json(p.dir / "status.json") or {}
+    return stt.get("state") == "running" and pid_alive(stt.get("pid"))
+
+
 def status_box(p: Project, job_filter=None):
     stt = read_json(p.dir / "status.json")
     if not stt or (job_filter and stt["job"] not in ((job_filter,) if isinstance(job_filter, str) else job_filter)):
         return None
+    if stt["state"] == "running" and not pid_alive(stt.get("pid")):
+        time.sleep(1)   # có thể worker vừa xong và đang ghi status -> đọc lại
+        stt = read_json(p.dir / "status.json") or stt
+        if stt["state"] == "running" and not pid_alive(stt.get("pid")):
+            stt = {**stt, "state": "error",
+                   "msg": "Tác vụ đã dừng giữa chừng (máy tắt / cửa sổ bị đóng). Bấm chạy lại để làm tiếp — "
+                          "phần đã xong được giữ lại."}
+    # vừa chạy xong -> tải lại cả trang để hiện kịch bản / video mới
+    seen = f"_seen_{p.name}_{stt['job']}"
+    prev = st.session_state.get(seen)
+    st.session_state[seen] = stt["state"]
+    if prev == "running" and stt["state"] != "running":
+        st.rerun(scope="app")
     if stt["state"] == "running":
         st.progress(min(stt["frac"], 1.0), text=stt["msg"])
         if st.button("⏹ Dừng", key=f"stop_{stt['job']}"):
@@ -292,45 +355,9 @@ def status_box(p: Project, job_filter=None):
     return stt["state"]
 
 
-MEDIA_TYPES = ["jpg", "jpeg", "png", "webp", "bmp", "mp4", "mov", "mkv", "webm"]
-
-
-def media_library(p, key):
-    """Khung tải ảnh/video vào dự án + danh sách file (xóa được). Trả về tên các file hiện có."""
-    files = local_clips(p.media)
-    with st.expander(f"📁 Ảnh & video của bạn ({len(files)} file)", expanded=not files):
-        ups = st.file_uploader("Tải ảnh/video lên dự án (chọn được nhiều file)", type=MEDIA_TYPES,
-                               accept_multiple_files=True, key=f"up_{key}")
-        added = False
-        for u in ups or []:
-            dest = p.media / u.name
-            if not dest.exists():
-                dest.write_bytes(u.getbuffer())
-                added = True
-        if added:
-            files = local_clips(p.media)
-        if files:
-            st.caption("Ảnh được tự thêm hiệu ứng zoom chậm. Dùng ô **📎 Chèn ảnh/video** ở từng cảnh để đặt "
-                       "đúng chỗ, hoặc bật nguồn footage **Ảnh/video tự nhập** (tab cài đặt) để app tự rải vào.")
-            cols = st.columns(6)
-            for i, f in enumerate(files):
-                c = cols[i % 6]
-                if is_image(f):
-                    c.image(str(f), width="stretch")
-                else:
-                    c.markdown("🎬")
-                c.caption(f.name)
-                if c.button("🗑️ Xóa", key=f"del_{key}_{f.name}"):
-                    f.unlink(missing_ok=True)
-                    st.rerun()
-        else:
-            st.caption("Chưa có file nào.")
-    return [f.name for f in files]
-
-
 # ---------- Tab 1 (tiếp): tạo + sửa kịch bản ----------
 with tab1:
-    if st.button("✨ Tạo kịch bản", type="primary", disabled=not topic.strip()):
+    if st.button("✨ Tạo kịch bản", type="primary", disabled=not topic.strip() or job_running(proj)):
         p = proj or Project.create(topic)
         p.save(cur, None)
         start_job(p, "script")
@@ -419,10 +446,11 @@ with tab1:
             missing = sum(1 for c in script["chapters"] for x in c["scenes"]
                           if not all(sh["kw"] for sh in shots_for(x)))
             c1, c2 = st.columns(2)
-            if c1.button("🔄 Viết lại toàn bộ kịch bản"):
+            busy = job_running(proj)
+            if c1.button("🔄 Viết lại toàn bộ kịch bản", disabled=busy):
                 start_job(proj, "script")
                 st.rerun()
-            if c2.button(f"🎯 Tạo từ khóa theo câu ({missing} cảnh còn thiếu)", disabled=not missing,
+            if c2.button(f"🎯 Tạo từ khóa theo câu ({missing} cảnh còn thiếu)", disabled=not missing or busy,
                          help="Gemini gợi ý từ khóa footage riêng cho từng câu để hình khớp lời đọc."):
                 start_job(proj, "keywords")
                 st.rerun()
@@ -432,7 +460,8 @@ with tab3:
     if not proj or not script:
         st.info("Cần có kịch bản trước.")
     else:
-        if st.button("🎬 Bắt đầu render", type="primary"):
+        if st.button("🎬 Bắt đầu render", type="primary", disabled=job_running(proj),
+                     help="Đang có tác vụ chạy cho dự án này." if job_running(proj) else None):
             proj.save(cur, script)
             start_job(proj, "render")
             st.rerun()
@@ -443,10 +472,12 @@ with tab3:
             status_box(proj, "render")
         render_status()
 
-        if proj.output.exists():
+        if proj.output.exists() and not job_running(proj):
             st.video(str(proj.output))
-            with open(proj.output, "rb") as f:
-                st.download_button("⬇️ Tải video", f, file_name=f"{proj.name}.mp4", mime="video/mp4")
+            # chỉ đọc file khi bấm tải (video dài có thể vài GB, đọc sẵn mỗi lần tải trang rất chậm)
+            st.download_button("⬇️ Tải video", lambda: proj.output.read_bytes(),
+                               file_name=f"{proj.name}.mp4", mime="video/mp4")
+            st.caption(f"File: `{proj.output}`")
             ch = proj.dir / "chapters.txt"
             if ch.exists():
                 st.text_area("Mốc chương (dán vào mô tả YouTube)", ch.read_text(encoding="utf-8"), height=150)
