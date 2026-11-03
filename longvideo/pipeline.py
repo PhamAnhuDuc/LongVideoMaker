@@ -8,11 +8,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import llm, music
-from .compose import concat_scenes, plan_segments, render_scene, scene_cues, write_ass
+from .compose import concat_scenes, pinned_segments, plan_segments, render_scene, scene_cues, write_ass
 from .config import PROJECTS, Settings
 from .footage import FootagePicker
 from .shots import shots_for, timeline
-from .tts import synth
+from .tts import clean_text, gemini_chapter, is_gemini, proportional, synth, whisper_word_times
 from .util import fmt_ts, read_json, write_json
 
 # số cảnh dựng cùng lúc và số luồng CPU cho mỗi ffmpeg (tổng ~ số luồng CPU)
@@ -99,7 +99,7 @@ def _scene_hash(s: Settings, sc, w, h):
              s.sub_position, s.sub_margin, s.transition, s.transition_dur, s.max_clip_sec, s.clip_mode,
              s.voice_volume, tuple(s.footage_sources), s.sub_timing)
     shots = json.dumps([x["kw"] for x in shots_for(sc)], ensure_ascii=False)
-    key = f"{sc['narration']}|{sc.get('keywords')}|{shots}|{s.voice}|{s.rate}|{w}x{h}|{style}"
+    key = f"{sc['narration']}|{sc.get('keywords')}|{shots}|{sc.get('media')}|{s.voice}|{s.rate}|{w}x{h}|{style}"
     return hashlib.md5(key.encode()).hexdigest()
 
 
@@ -117,25 +117,59 @@ def render(proj: Project, progress):
     total = len(scenes)
 
     # Pha 1: giọng đọc (song song) + mốc thời gian từ - bỏ qua cảnh đã làm
-    def tts_hash(sc):
+    gem = is_gemini(s.voice)
+    timing_key = f"{s.sub_timing}{s.whisper_model}" if s.subtitles else "sentence"
+
+    def tts_hash(ci, sc):
+        if gem:  # Gemini đọc cả chương một lần -> audio của cảnh phụ thuộc cả chương
+            body = "|".join(x["narration"] for x in script["chapters"][ci]["scenes"])
+            return hashlib.md5(f"{body}{s.voice}{s.rate}{s.voice_style}{timing_key}".encode()).hexdigest()
         return hashlib.md5(f"{sc['narration']}{s.voice}{s.rate}{s.sub_timing}{s.whisper_model}".encode()).hexdigest()
+
+    def is_done(ci, sc, d):
+        meta = read_json(d / "meta.json", {})
+        return meta.get("tts_hash") == tts_hash(ci, sc) and (d / "voice.mp3").exists()
 
     def tts_job(item):
         ci, si, sc, d = item
         d.mkdir(exist_ok=True)
         meta = read_json(d / "meta.json", {})
-        if meta.get("tts_hash") == tts_hash(sc) and (d / "voice.mp3").exists():
+        if meta.get("tts_hash") == tts_hash(ci, sc) and (d / "voice.mp3").exists():
             return item, meta
         dur, cues, words = synth(sc["narration"], s.voice, s.rate, d / "voice.mp3",
                                  s.sub_timing, s.language, s.whisper_model)
-        meta = {"tts_hash": tts_hash(sc), "dur": dur, "cues": cues, "words": words}
+        meta = {"tts_hash": tts_hash(ci, sc), "dur": dur, "cues": cues, "words": words}
         write_json(d / "meta.json", meta)
         return item, meta
+
+    def gemini_chapter_job(ci):
+        items = [it for it in scenes if it[0] == ci]
+        if all(is_done(c, sc, d) for c, _, sc, d in items):
+            return
+        for *_, d in items:
+            d.mkdir(exist_ok=True)
+        durs = gemini_chapter([sc["narration"] for _, _, sc, _ in items], s.voice, s.rate,
+                              [d / "voice.mp3" for *_, d in items], s.voice_style)
+        for (c, _, sc, d), dur in zip(items, durs):
+            words = None
+            if s.subtitles and s.sub_timing != "sentence":
+                words = whisper_word_times(sc["narration"], d / "voice.mp3", dur, s.language, s.whisper_model)
+            meta = {"tts_hash": tts_hash(c, sc), "dur": dur,
+                    "cues": proportional(clean_text(sc["narration"]), dur), "words": words}
+            write_json(d / "meta.json", meta)
 
     if s.sub_timing != "sentence" and s.subtitles:
         progress(0.0, "Nạp model Whisper (lần đầu sẽ tải về, hơi lâu)…")
         from . import align
         align.preload(s.whisper_model)
+    if gem:  # mỗi chương một lần gọi Gemini; xong thì tts_job bên dưới chỉ đọc lại meta đã lưu
+        n_ch = len(script["chapters"])
+        progress(0.0, f"Giọng Gemini: đọc {n_ch} chương…")
+        with ThreadPoolExecutor(2) as ex:
+            futs = [ex.submit(gemini_chapter_job, ci) for ci in range(n_ch)]
+            for k, f in enumerate(as_completed(futs)):
+                f.result()
+                progress(0.25 * (k + 1) / n_ch, f"Giọng Gemini: xong chương {k+1}/{n_ch}")
     metas = {}
     # edge-tts chủ yếu chờ mạng -> chạy nhiều luồng; Whisper ăn CPU/RAM nên giữ ít
     tts_workers = 2 if (s.sub_timing != "sentence" and s.subtitles) else 4
@@ -163,7 +197,11 @@ def render(proj: Project, progress):
         if out.exists() and meta.get("render_hash") == hsh:
             return
         t_eff = s.transition_dur if s.transition != "none" else 0.0
-        segs = plan_segments(timeline(sc, metas[d.name], sdur), picker, s.max_clip_sec, t_eff)
+        segs = None
+        if sc.get("media"):   # ảnh/video người dùng chọn riêng cho cảnh này
+            segs = pinned_segments(sc["media"], proj.media, sdur, t_eff)
+        if not segs:
+            segs = plan_segments(timeline(sc, metas[d.name], sdur), picker, s.max_clip_sec, t_eff)
         ass = None
         if s.subtitles:
             ass = d / "sub.ass"

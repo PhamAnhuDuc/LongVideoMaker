@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 from .config import Settings
+from .footage import is_image
 from .tts import split_cues, word_cues
 from .util import run
 
@@ -95,6 +96,36 @@ def plan_segments(timeline, picker, max_clip, trans):
     return segs
 
 
+def pinned_segments(files, media_dir: Path, total, trans):
+    """Cảnh có ảnh/video người dùng chọn sẵn: chia đều thời lượng cảnh cho các file theo thứ tự."""
+    from .util import duration
+    paths = [media_dir / f for f in files if (media_dir / f).exists()]
+    if not paths:
+        return None
+    d = total / len(paths)
+    segs = []
+    for p in paths:
+        if is_image(p):
+            segs.append({"path": str(p), "start": 0, "dur": round(d, 3), "loop": False})
+            continue
+        try:
+            cdur = duration(p)
+        except Exception:
+            cdur = 0
+        loop = cdur < d + trans + 0.2
+        segs.append({"path": str(p), "start": 0, "dur": round(d, 3), "loop": loop})
+    return segs
+
+
+def _ken_burns(w, h, dur, fps, i):
+    """Ảnh tĩnh -> zoom chậm (xen kẽ phóng to / thu nhỏ). Phóng ảnh gấp đôi trước để zoom không bị rung."""
+    frames = max(1, int(dur * fps))
+    step = 0.12 / frames
+    z = f"min(1+{step:.6f}*on,1.12)" if i % 2 == 0 else f"max(1.12-{step:.6f}*on,1)"
+    return (f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2},"
+            f"zoompan=z='{z}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}")
+
+
 def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st: Settings, fps=30, threads=0):
     n = len(segs)
     t = st.transition_dur if (st.transition != "none" and n > 1) else 0.0
@@ -106,6 +137,11 @@ def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st
         dur = sg["dur"] + (t if i < n - 1 else 0)
         if sg["path"] is None:
             cmd += ["-f", "lavfi", "-t", f"{dur:.3f}", "-i", f"color=c=0x101828:s={w}x{h}:r={fps}"]
+        elif is_image(sg["path"]):
+            cmd += ["-loop", "1", "-framerate", str(fps), "-t", f"{dur:.3f}", "-i", sg["path"]]
+            chains.append(f"[{i}:v]{_ken_burns(w, h, dur, fps, i)},setsar=1,format=yuv420p,"
+                          f"setpts=PTS-STARTPTS[v{i}]")
+            continue
         elif sg["loop"]:
             cmd += ["-stream_loop", "-1", "-t", f"{dur:.3f}", "-i", sg["path"]]
         else:

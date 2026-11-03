@@ -6,3 +6,4 @@ cache/
 projects/
 streamlit.log
 assets/music/*.mp3
+streamlit.err.log

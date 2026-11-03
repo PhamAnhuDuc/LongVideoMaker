@@ -39,6 +39,28 @@ VOICES = {
     "en": ["en-US-AriaNeural", "en-US-GuyNeural", "en-US-JennyNeural",
            "en-GB-SoniaNeural", "en-GB-RyanNeural", "en-AU-NatashaNeural"],
 }
+# Giọng Gemini TTS (đọc được mọi ngôn ngữ, chỉnh phong cách bằng lời). Mã giọng lưu dạng "gemini:<tên>".
+GEMINI_TTS_MODEL = "gemini-3.8-flash-tts"
+GEMINI_TTS_FALLBACK = "gemini-3.8-flash-lite-tts"
+GEMINI_VOICES = {
+    "Charon": "nam, trầm, kể chuyện", "Orus": "nam, chắc, rõ ràng", "Fenrir": "nam, hào hứng",
+    "Iapetus": "nam, trong", "Algieba": "nam, mượt", "Alnilam": "nam, vững", "Enceladus": "nam, thì thầm",
+    "Rasalgethi": "nam, truyền cảm", "Sadaltager": "nam, hiểu biết", "Gacrux": "nam, trưởng thành",
+    "Kore": "nữ, chắc, rõ ràng", "Aoede": "nữ, nhẹ nhàng", "Leda": "nữ, trẻ trung", "Zephyr": "nữ, tươi sáng",
+    "Despina": "nữ, mượt", "Erinome": "nữ, trong", "Sulafat": "nữ, ấm", "Achernar": "nữ, mềm",
+    "Vindemiatrix": "nữ, dịu dàng", "Pulcherrima": "nữ, mạnh mẽ", "Puck": "nam, vui tươi",
+}
+for _lang in VOICES:
+    VOICES[_lang] = VOICES[_lang] + [f"gemini:{n}" for n in GEMINI_VOICES]
+
+
+def voice_label(v: str) -> str:
+    if v.startswith("gemini:"):
+        n = v[7:]
+        return f"✨ Gemini · {n} ({GEMINI_VOICES.get(n, '')})"
+    return f"Microsoft · {v}"
+
+
 # số từ/phút ước lượng khi đọc (chỉ để lập kế hoạch; thời lượng thật đo sau khi TTS)
 WORDS_PER_MIN = {"vi": 190, "en": 150}
 LANG_NAME = {"vi": "Tiếng Việt", "en": "English"}
@@ -62,6 +84,7 @@ class Settings:
     # giọng đọc
     voice: str = "vi-VN-HoaiMyNeural"
     rate: int = 0                   # % tốc độ đọc, -30..+30
+    voice_style: str = ""           # chỉ cho giọng Gemini: mô tả cách đọc
     voice_volume: int = 100         # % âm lượng giọng
     # hình
     aspect: str = "16:9"            # 16:9 | 9:16

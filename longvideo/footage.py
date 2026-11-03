@@ -11,14 +11,20 @@ from .config import CACHE
 from .util import duration
 
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 _lock = threading.Lock()
 _search_cache: dict = {}
 
 
+def is_image(p) -> bool:
+    return Path(p).suffix.lower() in IMAGE_EXT
+
+
 def local_clips(media_dir: Path):
+    """Ảnh + video người dùng đã tải vào dự án."""
     if not media_dir.exists():
         return []
-    return sorted(p for p in media_dir.iterdir() if p.suffix.lower() in VIDEO_EXT)
+    return sorted(p for p in media_dir.iterdir() if p.suffix.lower() in VIDEO_EXT | IMAGE_EXT)
 
 
 def _get(url, **kw):
@@ -109,6 +115,8 @@ class FootagePicker:
 
     def _dur(self, p):
         k = str(p)
+        if is_image(p):   # ảnh tĩnh: hiển thị bao lâu cũng được
+            return 1e6
         if k not in self.durs:
             try:
                 self.durs[k] = duration(p)

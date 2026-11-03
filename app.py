@@ -1,15 +1,19 @@
 import os
+import re
+import shutil
 import signal
+import stat
 import subprocess
 import sys
+import time
 
 import streamlit as st
 
 from longvideo import music
 from longvideo.compose import preview_subtitle
-from longvideo.config import (CACHE, LANG_NAME, ROOT, SOURCES, TRANSITIONS, VOICES, WORDS_PER_MIN,
+from longvideo.config import (CACHE, LANG_NAME, PROJECTS, ROOT, SOURCES, TRANSITIONS, VOICES, WORDS_PER_MIN, voice_label,
                               Settings, save_env)
-from longvideo.footage import local_clips
+from longvideo.footage import is_image, local_clips
 from longvideo.pipeline import Project, list_projects
 from longvideo.script_parse import parse_script
 from longvideo.shots import shots_for
@@ -35,10 +39,59 @@ with st.sidebar:
         st.success("Đã lưu")
     st.divider()
     st.header("📁 Dự án")
+
+    def project_label(name):
+        if name == "➕ Dự án mới":
+            return name
+        d = read_json(PROJECTS / name / "project.json", {}) or {}
+        title = ((d.get("script") or {}).get("title") or (d.get("settings") or {}).get("topic") or "").strip()
+        when = f"{name[2:4]}/{name[:2]} {name[5:7]}:{name[7:9]}" if re.match(r"\d{4}-\d{4}", name) else ""
+        done = " ✅" if (PROJECTS / name / "final.mp4").exists() else ""
+        return f"{title or name} · {when}{done}" if when else f"{title or name}{done}"
+
+    def delete_project_box(p):
+        size = sum(f.stat().st_size for f in p.dir.rglob("*") if f.is_file()) / 1e6
+        with st.expander(f"🗑️ Xóa dự án này ({size:,.0f} MB)"):
+            st.caption("Xóa vĩnh viễn kịch bản, giọng đọc, ảnh/video đã tải lên và video thành phẩm của dự án. "
+                       "Không khôi phục được.")
+            sure = st.checkbox("Tôi chắc chắn muốn xóa", key=f"sure_{p.name}")
+            if st.button("Xóa vĩnh viễn", type="primary", disabled=not sure, key=f"del_{p.name}"):
+                stt = read_json(p.dir / "status.json") or {}
+                if stt.get("state") == "running" and stt.get("pid"):   # đang render -> dừng trước khi xóa
+                    try:
+                        if os.name == "nt":
+                            subprocess.run(["taskkill", "/PID", str(stt["pid"]), "/T", "/F"], capture_output=True)
+                        else:
+                            os.killpg(os.getpgid(stt["pid"]), signal.SIGTERM)
+                    except Exception:
+                        pass
+
+                def _force(func, path, _exc):   # file chỉ-đọc trên Windows
+                    os.chmod(path, stat.S_IWRITE)
+                    func(path)
+                for _ in range(5):   # Windows có thể còn giữ file vài giây sau khi dừng ffmpeg
+                    try:
+                        shutil.rmtree(p.dir, onerror=_force)
+                        break
+                    except OSError:
+                        time.sleep(1)
+                if p.dir.exists():
+                    st.error("Không xóa hết được (có file đang được mở, vd video đang phát). Đóng nó rồi thử lại.")
+                else:
+                    st.session_state["pending_choice"] = "➕ Dự án mới"
+                    st.session_state["deleted_msg"] = True
+                    st.rerun()
     projects = list_projects()
     if "pending_choice" in st.session_state:
         st.session_state["proj_choice"] = st.session_state.pop("pending_choice")
-    choice = st.selectbox("Mở dự án", ["➕ Dự án mới"] + projects, key="proj_choice")
+    if st.session_state.get("proj_choice") not in ["➕ Dự án mới"] + projects:
+        st.session_state["proj_choice"] = "➕ Dự án mới"
+    choice = st.selectbox("Mở dự án", ["➕ Dự án mới"] + projects, key="proj_choice",
+                          format_func=project_label)
+    if choice != "➕ Dự án mới":
+        delete_project_box(Project(choice))
+    if st.session_state.pop("deleted_msg", None):
+        st.success("Đã xóa dự án.")
 
 is_new = choice == "➕ Dự án mới"
 proj = None if is_new else Project(choice)
@@ -81,7 +134,18 @@ with tab2:
     voices = VOICES[lang]
     st.subheader("🎙️ Giọng đọc")
     c1, c2 = st.columns(2)
-    voice = c1.selectbox("Giọng đọc", voices, index=voices.index(settings.voice) if settings.voice in voices else 0)
+    voice = c1.selectbox("Giọng đọc", voices, index=voices.index(settings.voice) if settings.voice in voices else 0,
+                         format_func=voice_label,
+                         help="✨ Gemini: tự nhiên, có cảm xúc, dùng key Gemini (có hạn mức miễn phí). "
+                              "Microsoft: miễn phí, nhanh, phụ đề khớp chính xác hơn.")
+    voice_style = settings.voice_style
+    if voice.startswith("gemini:"):
+        voice_style = c1.text_input(
+            "Phong cách đọc (tùy chọn)", settings.voice_style,
+            placeholder="vd: Đọc bằng giọng kể chuyện trầm ấm, chậm rãi, hơi bí ẩn",
+            help="Mô tả cách đọc bằng lời. Để trống = đọc tự nhiên.")
+        c1.caption("Giọng Gemini không có mốc thời gian từng câu: phụ đề chia theo độ dài câu, "
+                   "muốn khớp chính xác hãy chọn căn phụ đề bằng Whisper.")
     rate = c1.slider("Tốc độ đọc (%)", -30, 30, settings.rate)
     voice_volume = c2.slider("Âm lượng giọng (%)", 50, 150, settings.voice_volume)
     sample = c2.text_input("Câu đọc thử", VOICE_SAMPLE[lang])
@@ -89,7 +153,7 @@ with tab2:
         try:
             out = CACHE / "voice_preview.mp3"
             with st.spinner("Đang tạo giọng…"):
-                synth(sample, voice, rate, out)
+                synth(sample, voice, rate, out, style=voice_style)
             st.session_state["voice_preview"] = out.read_bytes()
         except Exception as e:
             st.error(f"Không tạo được giọng thử: {e}")
@@ -104,7 +168,7 @@ with tab2:
     height = c1.radio("Độ phân giải", [720, 1080], index=[720, 1080].index(settings.height), horizontal=True,
                       format_func=lambda x: f"{x}p")
     sources = c2.multiselect("Nguồn footage", SOURCES, default=[x for x in settings.footage_sources if x in SOURCES],
-                             format_func={"pexels": "Pexels", "pixabay": "Pixabay", "local": "Video tự nhập"}.get)
+                             format_func={"pexels": "Pexels", "pixabay": "Pixabay", "local": "Ảnh/video tự nhập"}.get)
     clip_mode = c2.radio("Cách chọn clip", ["random", "sequential"], horizontal=True,
                          index=["random", "sequential"].index(settings.clip_mode),
                          format_func={"random": "Ngẫu nhiên", "sequential": "Lần lượt"}.get)
@@ -150,7 +214,7 @@ with tab2:
                                disabled=sub_position == "middle")
 
     cur = Settings(topic=topic, language=lang, minutes=minutes, tone=tone, audience=audience, notes=notes,
-                   gemini_model=model, voice=voice, rate=rate, voice_volume=voice_volume, aspect=aspect,
+                   gemini_model=model, voice=voice, rate=rate, voice_style=voice_style, voice_volume=voice_volume, aspect=aspect,
                    height=height, footage_sources=sources, clip_mode=clip_mode, max_clip_sec=max_clip,
                    transition=transition, transition_dur=trans_dur, subtitles=subs, sub_timing=sub_timing,
                    whisper_model=whisper_model, sub_font=sub_font, sub_bold=sub_bold, sub_color=sub_color,
@@ -190,13 +254,7 @@ with tab2:
                 "sau đó quay lại đây tải video/nhạc lên.")
     else:
         if "local" in sources:
-            ups = st.file_uploader("Tải video của bạn (nhiều file)", type=["mp4", "mov", "mkv", "webm"],
-                                   accept_multiple_files=True)
-            for u in ups or []:
-                dest = proj.media / u.name
-                if not dest.exists():
-                    dest.write_bytes(u.getbuffer())
-            st.caption(f"Đang có {len(local_clips(proj.media))} video trong dự án.")
+            media_library(proj, "lib2")
         if bgm_mode == "upload":
             bg = st.file_uploader("Nhạc nền của bạn", type=["mp3", "wav", "m4a", "ogg"])
             if bg:
@@ -218,7 +276,10 @@ def status_box(p: Project, job_filter=None):
         st.progress(min(stt["frac"], 1.0), text=stt["msg"])
         if st.button("⏹ Dừng", key=f"stop_{stt['job']}"):
             try:
-                os.killpg(os.getpgid(stt["pid"]), signal.SIGTERM)
+                if os.name == "nt":   # Windows: dừng cả tiến trình worker lẫn ffmpeg con
+                    subprocess.run(["taskkill", "/PID", str(stt["pid"]), "/T", "/F"], capture_output=True)
+                else:
+                    os.killpg(os.getpgid(stt["pid"]), signal.SIGTERM)
             except Exception:
                 pass
             from longvideo.util import write_json
@@ -229,6 +290,42 @@ def status_box(p: Project, job_filter=None):
     elif stt["state"] == "done":
         st.success(stt["msg"])
     return stt["state"]
+
+
+MEDIA_TYPES = ["jpg", "jpeg", "png", "webp", "bmp", "mp4", "mov", "mkv", "webm"]
+
+
+def media_library(p, key):
+    """Khung tải ảnh/video vào dự án + danh sách file (xóa được). Trả về tên các file hiện có."""
+    files = local_clips(p.media)
+    with st.expander(f"📁 Ảnh & video của bạn ({len(files)} file)", expanded=not files):
+        ups = st.file_uploader("Tải ảnh/video lên dự án (chọn được nhiều file)", type=MEDIA_TYPES,
+                               accept_multiple_files=True, key=f"up_{key}")
+        added = False
+        for u in ups or []:
+            dest = p.media / u.name
+            if not dest.exists():
+                dest.write_bytes(u.getbuffer())
+                added = True
+        if added:
+            files = local_clips(p.media)
+        if files:
+            st.caption("Ảnh được tự thêm hiệu ứng zoom chậm. Dùng ô **📎 Chèn ảnh/video** ở từng cảnh để đặt "
+                       "đúng chỗ, hoặc bật nguồn footage **Ảnh/video tự nhập** (tab cài đặt) để app tự rải vào.")
+            cols = st.columns(6)
+            for i, f in enumerate(files):
+                c = cols[i % 6]
+                if is_image(f):
+                    c.image(str(f), width="stretch")
+                else:
+                    c.markdown("🎬")
+                c.caption(f.name)
+                if c.button("🗑️ Xóa", key=f"del_{key}_{f.name}"):
+                    f.unlink(missing_ok=True)
+                    st.rerun()
+        else:
+            st.caption("Chưa có file nào.")
+    return [f.name for f in files]
 
 
 # ---------- Tab 1 (tiếp): tạo + sửa kịch bản ----------
@@ -283,12 +380,25 @@ with tab1:
             st.subheader(script["title"])
             st.caption(f"{script['description']}  \n**{len(script['chapters'])} chương · {words} từ · "
                        f"ước tính ~{words / WORDS_PER_MIN[settings.language]:.0f} phút**")
+            media_names = media_library(proj, "lib1")
             edited = False
             for ci, ch in enumerate(script["chapters"]):
                 with st.expander(f"Chương {ci+1}: {ch['title']}  ({len(ch['scenes'])} cảnh)"):
                     for si, sc in enumerate(ch["scenes"]):
                         a, b = st.columns([3, 2])
                         n = a.text_area(f"Cảnh {si+1}", sc["narration"], key=f"n{ci}_{si}", height=120)
+                        if media_names:
+                            cur_media = [m for m in sc.get("media", []) if m in media_names]
+                            sel = a.multiselect("📎 Chèn ảnh/video vào cảnh này (theo thứ tự)", media_names,
+                                                default=cur_media, key=f"m{ci}_{si}",
+                                                help="Để trống = tự tìm footage theo từ khóa. Chọn nhiều file thì "
+                                                     "thời lượng cảnh được chia đều cho từng file.")
+                            if sel != sc.get("media", []):
+                                sc["media"] = sel
+                                edited = True
+                            imgs = [proj.media / m for m in sel if is_image(m)]
+                            if imgs:
+                                a.image([str(x) for x in imgs], width=90)
                         shots = shots_for(sc)
                         k = b.text_area("Từ khóa theo câu (dòng i = câu i: cụ thể, chung)",
                                         "\n".join(", ".join(x["kw"]) for x in shots), key=f"k{ci}_{si}", height=120,
