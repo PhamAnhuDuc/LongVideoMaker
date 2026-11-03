@@ -22,18 +22,59 @@ def _parse_json(text: str):
     return json.loads(text)
 
 
+DEFAULT_MODEL = "gemini-3.5-flash"
+# model Google đã ngừng cấp cho tài khoản mới -> tự chuyển sang model mặc định
+RETIRED = {"gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"}
+FALLBACKS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
+_SWITCHED = {}   # model đã quá tải -> model dự phòng đang dùng (nhớ trong lần chạy này)
+
+
+def _thinking(model, level):
+    """Giảm 'suy nghĩ' của model Gemini 3 để viết nhanh hơn nhiều (văn kể chuyện không cần suy luận sâu)."""
+    from google.genai import types
+    if level and model.startswith("gemini-3"):
+        return types.ThinkingConfig(thinking_level=level)
+    return None
+
+
 def ask_json(prompt: str, model: str, temperature=0.8, tries=5):
     from google.genai import types
+    from google.genai import errors
     client = _client()
-    last = None
+    model = DEFAULT_MODEL if model.strip() in RETIRED else model.strip()
+    asked = model
+    model = _SWITCHED.get(model, model)   # đã quá tải lần trước -> dùng luôn model dự phòng
+    # model quá tải (503/504) liên tục -> tự chuyển sang model dự phòng
+    backups = [m for m in FALLBACKS if m != model]
+    levels = ["MINIMAL", "LOW", None]   # model nào không hỗ trợ MINIMAL thì lùi dần
+    last, busy = None, 0
+    tries += len(backups) * 2
     for i in range(tries):
         try:
             r = client.models.generate_content(
                 model=model, contents=prompt,
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json", temperature=temperature))
+                    response_mime_type="application/json", temperature=temperature,
+                    thinking_config=_thinking(model, levels[0])))
             return _parse_json(r.text)
-        except Exception as e:  # 429/503/JSON lỗi -> thử lại
+        except errors.ClientError as e:   # lỗi 4xx: sai key/model -> báo ngay, không chờ
+            last = e
+            if e.code == 400 and "thinking level" in str(e).lower() and len(levels) > 1:
+                levels.pop(0)
+                continue
+            if e.code != 429:
+                raise RuntimeError(f"Gemini lỗi: {e}") from e
+            time.sleep(min(2 ** i * 2, 30))
+        except errors.ServerError as e:  # 503 quá tải / 504 hết giờ
+            last, busy = e, busy + 1
+            if busy >= 2 and backups:
+                model, busy = backups.pop(0), 0
+                _SWITCHED[asked] = model
+                levels = ["MINIMAL", "LOW", None]
+                print(f"[gemini] model quá tải, chuyển sang {model}", flush=True)
+                continue
+            time.sleep(min(2 ** busy * 2, 20))
+        except Exception as e:  # JSON lỗi... -> thử lại
             last = e
             time.sleep(min(2 ** i * 2, 30))
     raise RuntimeError(f"Gemini lỗi sau {tries} lần thử: {last}")
@@ -87,8 +128,29 @@ Quy tắc:
 - Tổng độ dài chương KHOẢNG {target} từ (không ít hơn {int(target*0.9)} từ). {short_note}
 - Chia thành các cảnh; mỗi cảnh 30-55 từ, là 2-4 câu hoàn chỉnh. Văn nói tự nhiên, có số liệu/ví dụ cụ thể, tránh lặp ý.
 - Chỉ chữ thuần để đọc: không markdown, không emoji, không ghi chú sân khấu, không viết "Chương X".
-- Mỗi cảnh có 2-3 cụm từ khóa TIẾNG ANH, cụ thể và quay phim được (vd "busy city street at night"), dùng để tìm video minh họa.
-Trả về JSON: {{"scenes": [{{"narration": "...", "keywords": ["...", "..."]}}]}}"""
+- Mỗi cảnh tách thành từng CÂU (shots). Mỗi câu kèm từ khóa TIẾNG ANH để tìm video stock minh họa ĐÚNG nội dung câu đó:
+  kw = [cụ thể, chung hơn], mỗi từ khóa 1-3 từ, là thứ quay phim được (vật, người, nơi chốn, hành động),
+  vd câu nói về kim tự tháp -> ["egyptian pyramid", "desert"]; câu về lãi suất -> ["bank interest", "money"].
+  Ý trừu tượng thì chọn hình ẩn dụ cụ thể (vd "suy nghĩ" -> ["man thinking", "person window"]).
+- "keywords" của cảnh: 1-2 từ khóa chung cho cả cảnh (dự phòng).
+Trả về JSON: {{"scenes": [{{"shots": [{{"text": "một câu", "kw": ["...", "..."]}}], "keywords": ["..."]}}]}}"""
+
+
+def _clean_kw(lst, n=3):
+    return [k.strip() for k in (lst or []) if isinstance(k, str) and k.strip()][:n]
+
+
+def _scene(x: dict, title: str):
+    """Chuẩn hóa 1 cảnh Gemini trả về: narration = ghép các câu trong shots."""
+    shots = [{"text": re.sub(r"[*_#`]", "", sh.get("text", "")).strip(), "kw": _clean_kw(sh.get("kw"))}
+             for sh in x.get("shots") or [] if isinstance(sh, dict)]
+    shots = [sh for sh in shots if sh["text"]]
+    narration = " ".join(sh["text"] for sh in shots) or re.sub(r"[*_#`]", "", x.get("narration", "")).strip()
+    kws = _clean_kw(x.get("keywords"), 2) or next((sh["kw"][-1:] for sh in shots if sh["kw"]), [])
+    sc = {"narration": narration, "keywords": kws or [title]}
+    if shots:
+        sc["shots"] = shots
+    return sc
 
 
 def write_chapter(s: Settings, project: dict, idx: int):
@@ -99,9 +161,8 @@ def write_chapter(s: Settings, project: dict, idx: int):
     best, note = [], ""
     for _ in range(3):
         out = ask_json(_chapter_prompt(s, project, idx, target, prev_tail, note), s.gemini_model)
-        scenes = [{"narration": re.sub(r"[*_#`]", "", x["narration"]).strip(),
-                   "keywords": [k for k in x.get("keywords", []) if k][:3] or [project["title"]]}
-                  for x in out.get("scenes", []) if x.get("narration", "").strip()]
+        scenes = [_scene(x, project["title"]) for x in out.get("scenes", [])]
+        scenes = [x for x in scenes if x["narration"]]
         words = sum(len(x["narration"].split()) for x in scenes)
         if words > sum(len(x["narration"].split()) for x in best):
             best = scenes
@@ -112,24 +173,34 @@ def write_chapter(s: Settings, project: dict, idx: int):
 
 
 def make_keywords(s: Settings, project: dict, progress=None):
-    """Tạo từ khóa footage (tiếng Anh) cho các cảnh chưa có từ khóa (dùng cho kịch bản tự dán)."""
+    """Tạo từ khóa footage theo TỪNG CÂU cho các cảnh chưa có (dùng cho kịch bản tự dán / kịch bản cũ)."""
+    from .shots import shots_for
     todo = [(ci, si) for ci, c in enumerate(project["chapters"]) for si, x in enumerate(c["scenes"])
-            if not x.get("keywords")]
-    for b in range(0, len(todo), 15):
-        batch = todo[b:b + 15]
-        items = "\n".join(f"{k}. {project['chapters'][ci]['scenes'][si]['narration'][:300]}"
-                          for k, (ci, si) in enumerate(batch))
-        prompt = f"""Với mỗi đoạn lời đọc dưới đây (video "{project['title']}"), đề xuất 2-3 cụm từ khóa TIẾNG ANH
-cụ thể, quay phim được (vd "busy city street at night"), dùng để tìm video stock minh họa.
-Các đoạn:
-{items}
-Trả về JSON: {{"keywords": [["...","..."], ...]}} đúng {len(batch)} phần tử theo thứ tự."""
-        try:
-            kws = ask_json(prompt, s.gemini_model, temperature=0.4)["keywords"]
-        except Exception:
-            kws = []
+            if not x.get("shots") or not all(sh.get("kw") for sh in x["shots"])]
+    batch_size = 10
+    for b in range(0, len(todo), batch_size):
+        batch = todo[b:b + batch_size]
+        items, shot_lists = [], []
         for k, (ci, si) in enumerate(batch):
-            got = [x for x in (kws[k] if k < len(kws) else []) if isinstance(x, str) and x][:3]
-            project["chapters"][ci]["scenes"][si]["keywords"] = got or [project["title"]]
+            sh = shots_for(project["chapters"][ci]["scenes"][si])
+            shot_lists.append(sh)
+            items.append(f"Cảnh {k}:\n" + "\n".join(f"  {k}.{j}: {x['text'][:250]}" for j, x in enumerate(sh)))
+        prompt = f"""Video "{project['title']}". Với MỖI CÂU lời đọc dưới đây, đề xuất từ khóa TIẾNG ANH để tìm video stock
+minh họa đúng nội dung câu đó: [cụ thể, chung hơn], mỗi từ khóa 1-3 từ, quay phim được (vật, người, nơi, hành động).
+Ý trừu tượng thì chọn hình ẩn dụ cụ thể. Vd câu về kim tự tháp -> ["egyptian pyramid", "desert"].
+{chr(10).join(items)}
+Trả về JSON: {{"shots": {{"0.0": ["...", "..."], "0.1": [...], ...}}, "scenes": {{"0": ["từ khóa chung cả cảnh"], ...}}}}
+Phải có đủ mọi khóa câu ở trên."""
+        try:
+            out = ask_json(prompt, s.gemini_model, temperature=0.4)
+        except Exception:
+            out = {}
+        got_shots, got_scenes = out.get("shots") or {}, out.get("scenes") or {}
+        for k, (ci, si) in enumerate(batch):
+            sc = project["chapters"][ci]["scenes"][si]
+            general = _clean_kw(got_scenes.get(str(k)), 2) or _clean_kw(sc.get("keywords"), 2)
+            sc["shots"] = [{"text": x["text"], "kw": x["kw"] or _clean_kw(got_shots.get(f"{k}.{j}"))}
+                           for j, x in enumerate(shot_lists[k])]
+            sc["keywords"] = general or next((x["kw"][-1:] for x in sc["shots"] if x["kw"]), []) or [project["title"]]
         if progress:
             progress(min(1.0, (b + len(batch)) / max(1, len(todo))), f"Từ khóa {b + len(batch)}/{len(todo)}")

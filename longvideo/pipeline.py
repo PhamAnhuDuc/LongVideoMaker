@@ -1,5 +1,7 @@
 """Điều phối: tạo kịch bản và render video theo project (có thể chạy tiếp khi bị ngắt)."""
 import hashlib
+import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,8 +11,14 @@ from . import llm, music
 from .compose import concat_scenes, plan_segments, render_scene, scene_cues, write_ass
 from .config import PROJECTS, Settings
 from .footage import FootagePicker
+from .shots import shots_for, timeline
 from .tts import synth
 from .util import fmt_ts, read_json, write_json
+
+# số cảnh dựng cùng lúc và số luồng CPU cho mỗi ffmpeg (tổng ~ số luồng CPU)
+_CPU = os.cpu_count() or 4
+SCENE_WORKERS = max(1, min(4, _CPU // 3))
+SCENE_THREADS = max(1, _CPU // SCENE_WORKERS)
 
 
 class Project:
@@ -89,8 +97,9 @@ def run_full(proj: Project, progress):
 def _scene_hash(s: Settings, sc, w, h):
     style = (s.subtitles, s.sub_font, s.sub_bold, s.sub_color, s.sub_outline_color, s.sub_size, s.sub_outline,
              s.sub_position, s.sub_margin, s.transition, s.transition_dur, s.max_clip_sec, s.clip_mode,
-             s.voice_volume, tuple(s.footage_sources))
-    key = f"{sc['narration']}|{sc['keywords']}|{s.voice}|{s.rate}|{w}x{h}|{style}"
+             s.voice_volume, tuple(s.footage_sources), s.sub_timing)
+    shots = json.dumps([x["kw"] for x in shots_for(sc)], ensure_ascii=False)
+    key = f"{sc['narration']}|{sc.get('keywords')}|{shots}|{s.voice}|{s.rate}|{w}x{h}|{style}"
     return hashlib.md5(key.encode()).hexdigest()
 
 
@@ -128,36 +137,46 @@ def render(proj: Project, progress):
         from . import align
         align.preload(s.whisper_model)
     metas = {}
-    with ThreadPoolExecutor(2) as ex:
+    # edge-tts chủ yếu chờ mạng -> chạy nhiều luồng; Whisper ăn CPU/RAM nên giữ ít
+    tts_workers = 2 if (s.sub_timing != "sentence" and s.subtitles) else 4
+    with ThreadPoolExecutor(tts_workers) as ex:
         futs = [ex.submit(tts_job, it) for it in scenes]
         for k, f in enumerate(as_completed(futs)):
             item, meta = f.result()
             metas[item[3].name] = meta
             progress(0.25 * (k + 1) / total, f"Giọng đọc {k+1}/{total}")
 
-    # Pha 2: dựng từng cảnh
-    files, starts, t = [], [], 0.0
+    # Pha 2: dựng các cảnh song song (cảnh này tải footage trong lúc cảnh khác đang mã hóa)
+    files, t = [], 0.0
     ch_start = {}
-    for k, (ci, si, sc, d) in enumerate(scenes):
-        dur = metas[d.name]["dur"]
-        sdur = dur + 0.35
+    for ci, si, sc, d in scenes:
+        ch_start.setdefault(ci, t)
+        files.append(d / "scene.mp4")
+        t += metas[d.name]["dur"] + 0.35
+
+    def scene_job(item):
+        ci, si, sc, d = item
+        sdur = metas[d.name]["dur"] + 0.35
         out = d / "scene.mp4"
         hsh = _scene_hash(s, sc, w, h)
         meta = read_json(d / "meta.json", {})
-        if not (out.exists() and meta.get("render_hash") == hsh):
-            t_eff = s.transition_dur if s.transition != "none" else 0.0
-            segs = plan_segments(sdur, picker, sc["keywords"], s.max_clip_sec, t_eff)
-            ass = None
-            if s.subtitles:
-                ass = d / "sub.ass"
-                write_ass(scene_cues(metas[d.name], portrait), ass, w, h, s)
-            render_scene(segs, d / "voice.mp3", ass, out, w, h, sdur, s)
-            meta["render_hash"] = hsh
-            write_json(d / "meta.json", meta)
-        ch_start.setdefault(ci, t)
-        files.append(out)
-        t += sdur
-        progress(0.25 + 0.70 * (k + 1) / total, f"Dựng cảnh {k+1}/{total}")
+        if out.exists() and meta.get("render_hash") == hsh:
+            return
+        t_eff = s.transition_dur if s.transition != "none" else 0.0
+        segs = plan_segments(timeline(sc, metas[d.name], sdur), picker, s.max_clip_sec, t_eff)
+        ass = None
+        if s.subtitles:
+            ass = d / "sub.ass"
+            write_ass(scene_cues(metas[d.name], portrait), ass, w, h, s)
+        render_scene(segs, d / "voice.mp3", ass, out, w, h, sdur, s, threads=SCENE_THREADS)
+        meta["render_hash"] = hsh
+        write_json(d / "meta.json", meta)
+
+    with ThreadPoolExecutor(SCENE_WORKERS) as ex:
+        futs = [ex.submit(scene_job, it) for it in scenes]
+        for k, f in enumerate(as_completed(futs)):
+            f.result()
+            progress(0.25 + 0.70 * (k + 1) / total, f"Dựng cảnh {k+1}/{total}")
 
     progress(0.96, "Ghép video cuối…")
     bgm = music.pick(s.bgm_mode, s.bgm_track, proj.bgm)

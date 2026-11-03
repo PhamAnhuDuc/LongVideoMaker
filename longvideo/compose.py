@@ -1,4 +1,5 @@
 """Dựng từng cảnh (footage + chuyển cảnh + giọng + phụ đề) rồi ghép thành video dài."""
+import math
 import random
 import tempfile
 from pathlib import Path
@@ -74,28 +75,27 @@ def preview_subtitle(st: Settings, text: str, out_png: Path):
              "-vf", "ass=p.ass", "-frames:v", "1", str(out_png.resolve())], cwd=td)
 
 
-def plan_segments(total, picker, keywords, max_clip, trans):
-    """Chia thời lượng cảnh thành các đoạn (≤ max_clip), mỗi đoạn một clip."""
-    lo = min(3.0, max_clip)
-    segs, left = [], total
-    while left > 0.05:
-        d = min(left, random.uniform(max(lo, 0.6 * max_clip), max_clip))
-        rem = left - d
-        if 0 < rem < 1.5:
-            d = left if left <= max_clip + 0.01 else left / 2
-        path, cdur = picker.pick(keywords)
-        need = d + trans
-        if path is None:
-            segs.append({"path": None, "start": 0, "dur": round(d, 3), "loop": False})
-        else:
-            loop = cdur < need + 0.2
-            start = 0 if loop else (random.uniform(0, max(0, cdur - need - 0.1)) if picker.mode == "random" else 0)
-            segs.append({"path": str(path), "start": round(start, 2), "dur": round(d, 3), "loop": loop})
-        left -= d
+def plan_segments(timeline, picker, max_clip, trans):
+    """timeline = [(start, end, từ khóa)] theo từng câu. Mỗi câu một clip đúng chủ đề;
+    câu dài hơn max_clip thì chia đều thành vài clip cùng từ khóa."""
+    segs = []
+    for s0, e0, kws in timeline:
+        length = e0 - s0
+        parts = max(1, math.ceil(length / max_clip - 0.15))
+        for _ in range(parts):
+            d = length / parts
+            path, cdur = picker.pick(kws)
+            need = d + trans
+            if path is None:
+                segs.append({"path": None, "start": 0, "dur": round(d, 3), "loop": False})
+            else:
+                loop = cdur < need + 0.2
+                start = 0 if loop else (random.uniform(0, max(0, cdur - need - 0.1)) if picker.mode == "random" else 0)
+                segs.append({"path": str(path), "start": round(start, 2), "dur": round(d, 3), "loop": loop})
     return segs
 
 
-def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st: Settings, fps=30):
+def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st: Settings, fps=30, threads=0):
     n = len(segs)
     t = st.transition_dur if (st.transition != "none" and n > 1) else 0.0
     if t:
@@ -129,6 +129,7 @@ def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st
     cmd += ["-i", str(audio), "-filter_complex", ";".join(chains + [join, last]),
             "-map", "[vo]", "-map", f"{n}:a", "-af", f"{vol}apad,aresample=44100", "-t", f"{total:.3f}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", str(fps),
+            *(["-threads", str(threads), "-filter_complex_threads", str(threads)] if threads else []),
             "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-movflags", "+faststart", str(out.resolve())]
     run(cmd, cwd=ass.parent if ass else None)
 

@@ -12,6 +12,7 @@ from .util import duration
 
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 _lock = threading.Lock()
+_search_cache: dict = {}
 
 
 def local_clips(media_dir: Path):
@@ -125,24 +126,41 @@ class FootagePicker:
         pool = [p for p in self.locals if str(p) not in self.used] or self.locals
         return random.choice(pool)
 
-    def _remote(self, source, keywords):
-        kws = keywords[:]
+    def _search(self, source, kw):
+        k = (source, kw.lower().strip(), self.portrait)
+        with _lock:
+            if k in _search_cache:
+                return _search_cache[k]
+        vids = SEARCH[source](kw, self.portrait)
+        if vids:  # không cache kết quả rỗng (có thể do lỗi mạng/429)
+            with _lock:
+                _search_cache[k] = vids
+        return vids
+
+    def _remote(self, source, kw):
+        vids = list(self._search(source, kw))
         if self.mode == "random":
-            random.shuffle(kws)
-        for kw in kws:
-            vids = SEARCH[source](kw, self.portrait)
-            if self.mode == "random":
-                random.shuffle(vids)
-            vids.sort(key=lambda v: v["id"] in self.used)  # ưu tiên clip chưa dùng (ổn định → giữ thứ tự)
-            for v in vids[:4]:
-                w, h, link = _best_file(v["files"], self.target_w, self.portrait)
-                p = _download(link, CACHE / source / f"{v['id']}_{w}x{h}.mp4")
-                if p:
-                    return p, v["id"]
+            random.shuffle(vids)
+        with _lock:
+            fresh = [v for v in vids if v["id"] not in self.used]
+        # clip chưa dùng trước; nếu từ khóa đã dùng hết clip thì trả None để thử từ khóa chung hơn
+        for v in fresh[:4]:
+            w, h, link = _best_file(v["files"], self.target_w, self.portrait)
+            p = _download(link, CACHE / source / f"{v['id']}_{w}x{h}.mp4")
+            if p:
+                return p, v["id"]
         return None, None
 
+    def _take(self, p, vid):
+        with _lock:
+            self.used.add(str(p))
+            if vid:
+                self.used.add(vid)
+        return p, self._dur(p)
+
     def pick(self, keywords):
-        """Trả về (path, độ dài clip) hoặc (None, 0) nếu không có footage."""
+        """keywords xếp từ cụ thể -> chung. Thử từ khóa cụ thể trên mọi nguồn trước rồi mới lùi dần.
+        Trả về (path, độ dài clip) hoặc (None, 0) nếu không có footage."""
         if not self.sources:
             return None, 0
         with _lock:
@@ -151,16 +169,24 @@ class FootagePicker:
                 self.rr += 1
             else:
                 order = random.sample(self.sources, len(self.sources))
-        for src in order:
-            if src == "local":
-                with _lock:
-                    p, vid = self._local(), None
-            else:
-                p, vid = self._remote(src, keywords)
-            if p:
-                with _lock:
-                    self.used.add(str(p))
-                    if vid:
-                        self.used.add(vid)
-                return p, self._dur(p)
+            if order[0] == "local":  # lượt này dùng video tự nhập
+                return self._take(self._local(), None)
+        remote = [x for x in order if x != "local"]
+        kws = [k for k in keywords if k and k.strip()]
+        for kw in kws:
+            for src in remote:
+                p, vid = self._remote(src, kw)
+                if p:
+                    return self._take(p, vid)
+        if "local" in order:
+            return self._take(self._local(), None)
+        # hết clip mới: chấp nhận dùng lại clip đã dùng của từ khóa cụ thể nhất
+        for kw in kws:
+            for src in remote:
+                vids = self._search(src, kw)
+                for v in vids[:4]:
+                    w, h, link = _best_file(v["files"], self.target_w, self.portrait)
+                    p = _download(link, CACHE / src / f"{v['id']}_{w}x{h}.mp4")
+                    if p:
+                        return self._take(p, v["id"])
         return None, 0

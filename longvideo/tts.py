@@ -1,6 +1,8 @@
 """Giọng đọc bằng edge-tts + tạo phụ đề theo câu."""
 import asyncio
+import random
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -14,19 +16,45 @@ def clean_text(t: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+# Server edge-tts hay chặn tạm (trả "No audio was received") khi gọi dồn dập.
+# Khi một luồng bị chặn, mọi luồng cùng nghỉ một lúc rồi mới gọi tiếp.
+_cool_lock = threading.Lock()
+_cool_until = 0.0
+
+
+def _wait_cooldown():
+    while True:
+        with _cool_lock:
+            left = _cool_until - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(left, 1.0))
+
+
+def _set_cooldown(sec):
+    global _cool_until
+    with _cool_lock:
+        _cool_until = max(_cool_until, time.time() + sec)
+
+
 async def _synth(text, voice, rate, out: Path, boundary="SentenceBoundary"):
     com = edge_tts.Communicate(text, voice, rate=f"{rate:+d}%", boundary=boundary)
     cues = []
-    with open(out, "wb") as f:
-        async for ch in com.stream():
-            if ch["type"] == "audio":
-                f.write(ch["data"])
-            elif ch["type"] == boundary:
-                cues.append((ch["offset"] / 1e7, (ch["offset"] + ch["duration"]) / 1e7, ch["text"]))
+    tmp = out.with_suffix(".part")
+    try:
+        with open(tmp, "wb") as f:
+            async for ch in com.stream():
+                if ch["type"] == "audio":
+                    f.write(ch["data"])
+                elif ch["type"] == boundary:
+                    cues.append((ch["offset"] / 1e7, (ch["offset"] + ch["duration"]) / 1e7, ch["text"]))
+        tmp.replace(out)  # chỉ ghi đè file thật khi đã nhận đủ audio
+    finally:
+        tmp.unlink(missing_ok=True)
     return cues
 
 
-def synth(text, voice, rate, out: Path, timing="sentence", lang="vi", whisper_model="base", tries=6):
+def synth(text, voice, rate, out: Path, timing="sentence", lang="vi", whisper_model="base", tries=10):
     """Trả về (độ dài giây, [(start,end,câu)], [(start,end,từ)] hoặc None)."""
     from . import align
     text = clean_text(text)
@@ -35,6 +63,7 @@ def synth(text, voice, rate, out: Path, timing="sentence", lang="vi", whisper_mo
     d = cues = None
     if timing == "word":  # thử mốc từng từ của edge-tts (chỉ một số giọng hỗ trợ)
         try:
+            _wait_cooldown()
             bounds = asyncio.run(_synth(text, voice, rate, out, "WordBoundary"))
             d = duration(out)
             if bounds and d > 0:
@@ -47,6 +76,7 @@ def synth(text, voice, rate, out: Path, timing="sentence", lang="vi", whisper_mo
         last = None
         for i in range(tries):
             try:
+                _wait_cooldown()
                 cues = asyncio.run(_synth(text, voice, rate, out))
                 d = duration(out)
                 if d <= 0:
@@ -54,9 +84,12 @@ def synth(text, voice, rate, out: Path, timing="sentence", lang="vi", whisper_mo
                 break
             except Exception as e:
                 last = e
-                time.sleep(1.5 * (i + 1))
+                wait = min(3 * 2 ** i, 60) + random.uniform(0, 2)  # 3s, 6s, 12s… tối đa 60s
+                print(f"[tts] lỗi lần {i + 1}/{tries}: {e} -> chờ {wait:.0f}s", flush=True)
+                _set_cooldown(wait)
         else:
-            raise RuntimeError(f"edge-tts lỗi: {last}")
+            raise RuntimeError(f"edge-tts lỗi sau {tries} lần thử (server Microsoft đang chặn tạm, "
+                               f"đợi vài phút rồi bấm render lại — các cảnh đã xong sẽ được giữ): {last}")
         cues = [(max(a, cues[i - 1][1]) if i else a, b, t) for i, (a, b, t) in enumerate(cues)]
         if not cues:  # không có mốc thời gian -> chia theo độ dài ký tự
             cues = proportional(text, d)

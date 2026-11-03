@@ -58,7 +58,7 @@ class Settings:
     tone: str = "hấp dẫn, kể chuyện, dễ hiểu"
     audience: str = "khán giả phổ thông"
     notes: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.5-flash"
     # giọng đọc
     voice: str = "vi-VN-HoaiMyNeural"
     rate: int = 0                   # % tốc độ đọc, -30..+30
@@ -66,7 +66,7 @@ class Settings:
     # hình
     aspect: str = "16:9"            # 16:9 | 9:16
     height: int = 720               # chiều cao video ngang (720/1080)
-    footage_sources: list = field(default_factory=lambda: ["pexels"])
+    footage_sources: list = field(default_factory=lambda: ["pixabay"])
     clip_mode: str = "random"       # random | sequential
     max_clip_sec: float = 7.0       # độ dài tối đa mỗi clip
     transition: str = "fade"

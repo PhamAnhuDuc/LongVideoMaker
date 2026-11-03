@@ -1,5 +1,8 @@
 import json
+import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 
@@ -37,6 +40,15 @@ def read_json(p, default=None):
 
 
 def write_json(p, data):
-    tmp = Path(str(p) + ".tmp")
+    # tên tmp riêng cho từng luồng để các luồng không giẫm lên nhau
+    tmp = Path(f"{p}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    # Windows: ghi đè thất bại nếu giao diện đang mở đọc file đúng lúc đó -> thử lại
+    for i in range(20):
+        try:
+            tmp.replace(p)
+            return
+        except PermissionError:
+            time.sleep(0.05 * (i + 1))
+    tmp.unlink(missing_ok=True)
+    raise PermissionError(f"Không ghi được {p} (file đang bị chương trình khác giữ)")

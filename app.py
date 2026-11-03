@@ -12,6 +12,7 @@ from longvideo.config import (CACHE, LANG_NAME, ROOT, SOURCES, TRANSITIONS, VOIC
 from longvideo.footage import local_clips
 from longvideo.pipeline import Project, list_projects
 from longvideo.script_parse import parse_script
+from longvideo.shots import shots_for
 from longvideo.tts import synth
 from longvideo.util import fmt_ts, read_json
 
@@ -286,17 +287,34 @@ with tab1:
             for ci, ch in enumerate(script["chapters"]):
                 with st.expander(f"Chương {ci+1}: {ch['title']}  ({len(ch['scenes'])} cảnh)"):
                     for si, sc in enumerate(ch["scenes"]):
-                        a, b = st.columns([3, 1])
-                        n = a.text_area(f"Cảnh {si+1}", sc["narration"], key=f"n{ci}_{si}", height=90)
-                        k = b.text_area("Từ khóa (mỗi dòng 1)", "\n".join(sc["keywords"]), key=f"k{ci}_{si}", height=90)
-                        kws = [x.strip() for x in k.splitlines() if x.strip()]
-                        if n != sc["narration"] or kws != sc["keywords"]:
-                            sc["narration"], sc["keywords"] = n, kws
+                        a, b = st.columns([3, 2])
+                        n = a.text_area(f"Cảnh {si+1}", sc["narration"], key=f"n{ci}_{si}", height=120)
+                        shots = shots_for(sc)
+                        k = b.text_area("Từ khóa theo câu (dòng i = câu i: cụ thể, chung)",
+                                        "\n".join(", ".join(x["kw"]) for x in shots), key=f"k{ci}_{si}", height=120,
+                                        help="\n\n".join(f"{j+1}. {x['text']}" for j, x in enumerate(shots)))
+                        lines = k.split("\n")
+                        new_shots = [{"text": x["text"],
+                                      "kw": [w.strip() for w in (lines[j] if j < len(lines) else "").split(",") if w.strip()]}
+                                     for j, x in enumerate(shots)]
+                        if n != sc["narration"]:
+                            sc["narration"] = n
+                            sc["shots"] = shots_for({**sc, "shots": new_shots})
+                            edited = True
+                        elif new_shots != sc.get("shots"):
+                            sc["shots"] = new_shots
                             edited = True
             if edited:
                 proj.save(settings, script)
-            if st.button("🔄 Viết lại toàn bộ kịch bản"):
+            missing = sum(1 for c in script["chapters"] for x in c["scenes"]
+                          if not all(sh["kw"] for sh in shots_for(x)))
+            c1, c2 = st.columns(2)
+            if c1.button("🔄 Viết lại toàn bộ kịch bản"):
                 start_job(proj, "script")
+                st.rerun()
+            if c2.button(f"🎯 Tạo từ khóa theo câu ({missing} cảnh còn thiếu)", disabled=not missing,
+                         help="Gemini gợi ý từ khóa footage riêng cho từng câu để hình khớp lời đọc."):
+                start_job(proj, "keywords")
                 st.rerun()
 
 # ---------- Tab 3 ----------
