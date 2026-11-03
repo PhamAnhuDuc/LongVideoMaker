@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 
 from .config import LANG_NAME, WORDS_PER_MIN, Settings
@@ -25,8 +26,22 @@ def _parse_json(text: str):
 DEFAULT_MODEL = "gemini-3.5-flash"
 # model Google đã ngừng cấp cho tài khoản mới -> tự chuyển sang model mặc định
 RETIRED = {"gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"}
-FALLBACKS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
-_SWITCHED = {}   # model đã quá tải -> model dự phòng đang dùng (nhớ trong lần chạy này)
+# Gói miễn phí giới hạn số lần gọi MỖI NGÀY cho TỪNG model -> hết model này thì chuyển ngay model khác
+FALLBACKS = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
+             "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest"]
+_SWITCHED = {}     # model đã quá tải -> model dự phòng đang dùng (nhớ trong lần chạy này)
+_EXHAUSTED = set()  # model đã hết hạn mức hôm nay
+_state_lock = threading.Lock()
+
+
+_ALL_OUT = ("Tất cả model Gemini miễn phí đã hết hạn mức hôm nay (mỗi model ~20 lần gọi/ngày). "
+            "Đợi sang ngày mới (khoảng 14-15h chiều giờ Việt Nam) hoặc bật thanh toán cho key Gemini.")
+
+
+def _retry_delay(e) -> float:
+    """Số giây Google bảo chờ (lỗi 429 theo phút), mặc định 10s."""
+    m = re.search(r"retry in ([\d.]+)s", str(e)) or re.search(r"'retryDelay': '(\d+)s'", str(e))
+    return min(float(m.group(1)) + 1, 65) if m else 10.0
 
 
 def _thinking(model, level):
@@ -43,12 +58,29 @@ def ask_json(prompt: str, model: str, temperature=0.8, tries=5):
     client = _client()
     model = DEFAULT_MODEL if model.strip() in RETIRED else model.strip()
     asked = model
-    model = _SWITCHED.get(model, model)   # đã quá tải lần trước -> dùng luôn model dự phòng
-    # model quá tải (503/504) liên tục -> tự chuyển sang model dự phòng
-    backups = [m for m in FALLBACKS if m != model]
+    with _state_lock:
+        model = _SWITCHED.get(model, model)   # đã quá tải / hết hạn mức lần trước -> dùng luôn model dự phòng
+        backups = [m for m in FALLBACKS if m != model and m not in _EXHAUSTED]
+        if model in _EXHAUSTED:
+            if not backups:
+                raise RuntimeError(_ALL_OUT)
+            model = backups.pop(0)
     levels = ["MINIMAL", "LOW", None]   # model nào không hỗ trợ MINIMAL thì lùi dần
     last, busy = None, 0
     tries += len(backups) * 2
+
+    def switch(reason):
+        nonlocal model, busy, levels
+        with _state_lock:
+            while backups and backups[0] in _EXHAUSTED:
+                backups.pop(0)
+            if not backups:
+                return False
+            model, busy, levels = backups.pop(0), 0, ["MINIMAL", "LOW", None]
+            _SWITCHED[asked] = model
+        print(f"[gemini] {reason}, chuyển sang {model}", flush=True)
+        return True
+
     for i in range(tries):
         try:
             r = client.models.generate_content(
@@ -62,16 +94,20 @@ def ask_json(prompt: str, model: str, temperature=0.8, tries=5):
             if e.code == 400 and "thinking level" in str(e).lower() and len(levels) > 1:
                 levels.pop(0)
                 continue
+            if e.code == 404 and switch(f"model {model} không dùng được"):
+                continue
             if e.code != 429:
                 raise RuntimeError(f"Gemini lỗi: {e}") from e
-            time.sleep(min(2 ** i * 2, 30))
+            if "PerDay" in str(e):   # hết hạn mức NGÀY của model này -> chờ vô ích, đổi model ngay
+                with _state_lock:
+                    _EXHAUSTED.add(model)
+                if switch(f"{model} hết hạn mức hôm nay"):
+                    continue
+                raise RuntimeError(_ALL_OUT) from e
+            time.sleep(_retry_delay(e))   # vượt giới hạn/phút -> chờ đúng thời gian Google yêu cầu
         except errors.ServerError as e:  # 503 quá tải / 504 hết giờ
             last, busy = e, busy + 1
-            if busy >= 2 and backups:
-                model, busy = backups.pop(0), 0
-                _SWITCHED[asked] = model
-                levels = ["MINIMAL", "LOW", None]
-                print(f"[gemini] model quá tải, chuyển sang {model}", flush=True)
+            if busy >= 2 and switch(f"{model} quá tải"):
                 continue
             time.sleep(min(2 ** busy * 2, 20))
         except Exception as e:  # JSON lỗi... -> thử lại
@@ -122,7 +158,9 @@ Dàn ý toàn video:
 
 Chương cần viết: #{idx+1} "{ch['title']}" - {ch['summary']}
 {pos}
-Đoạn cuối chương trước (để nối mạch): {prev_tail or '(không có)'}
+{f'Đoạn cuối chương trước (để nối mạch): {prev_tail}' if prev_tail else
+ (f'Chương trước: "{chs[idx-1]["title"]}" - mở đầu chương này bằng câu chuyển ý tự nhiên từ nội dung đó.' if idx > 0 else '')}
+{f'Chương sau: "{chs[idx+1]["title"]}" - câu cuối chương này gợi mở dẫn sang nội dung đó.' if idx < len(chs) - 1 else ''}
 
 Quy tắc:
 - Tổng độ dài chương KHOẢNG {target} từ (không ít hơn {int(target*0.9)} từ). {short_note}
@@ -153,10 +191,11 @@ def _scene(x: dict, title: str):
     return sc
 
 
-def write_chapter(s: Settings, project: dict, idx: int):
+def write_chapter(s: Settings, project: dict, idx: int, use_prev=True):
+    """use_prev=False: không chờ chương trước (để viết các chương song song) - nối mạch qua dàn ý."""
     _, target = plan(s)
     prev_tail = ""
-    if idx > 0 and project["chapters"][idx - 1]["scenes"]:
+    if use_prev and idx > 0 and project["chapters"][idx - 1]["scenes"]:
         prev_tail = " ".join(x["narration"] for x in project["chapters"][idx - 1]["scenes"][-2:])
     best, note = [], ""
     for _ in range(3):

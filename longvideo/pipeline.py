@@ -71,10 +71,16 @@ def generate_script(proj: Project, progress):
     script = llm.make_outline(s)
     proj.save(s, script)
     n = len(script["chapters"])
-    for i in range(n):
-        progress(0.05 + 0.93 * i / n, f"Viết chương {i+1}/{n}: {script['chapters'][i]['title']}")
-        script["chapters"][i]["scenes"] = llm.write_chapter(s, script, i)
-        proj.save(s, script)
+    # viết 3 chương cùng lúc (nhanh ~3 lần); mạch truyện nối qua dàn ý + tên chương trước/sau
+    progress(0.05, f"Đang viết {n} chương (3 chương cùng lúc)…")
+    outline = {"title": script["title"], "chapters": [{**c, "scenes": []} for c in script["chapters"]]}
+    with ThreadPoolExecutor(3) as ex:
+        futs = {ex.submit(llm.write_chapter, s, outline, i, False): i for i in range(n)}
+        for k, f in enumerate(as_completed(futs)):
+            i = futs[f]
+            script["chapters"][i]["scenes"] = f.result()
+            proj.save(s, script)
+            progress(0.05 + 0.93 * (k + 1) / n, f"Xong {k+1}/{n} chương (vừa xong: {script['chapters'][i]['title']})")
     words = sum(len(x["narration"].split()) for c in script["chapters"] for x in c["scenes"])
     progress(1.0, f"Xong kịch bản: {words} từ, ước tính ~{words / 170:.0f} phút.")
 
