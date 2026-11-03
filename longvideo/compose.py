@@ -160,11 +160,15 @@ def render_scene(segs, audio: Path, ass: Path | None, out: Path, w, h, total, st
         join = ";".join(parts) + f";[{prev}]null[vc]"
     else:
         join = "".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vc]"
-    last = f"[vc]ass={ass.name}[vo]" if ass else "[vc]null[vo]"
+    # Ép đầu ra về yuv420p dải tv: ảnh JPEG/footage 4:4:4 nếu lọt qua sẽ thành H.264 High 4:4:4,
+    # trình duyệt không phát được và ghép -c copy với cảnh 4:2:0 làm video đứt giữa chừng.
+    fix = "scale=out_range=tv,format=yuv420p"
+    last = f"[vc]ass={ass.name},{fix}[vo]" if ass else f"[vc]{fix}[vo]"
     vol = f"volume={st.voice_volume / 100:.2f}," if st.voice_volume != 100 else ""
     cmd += ["-i", str(audio), "-filter_complex", ";".join(chains + [join, last]),
             "-map", "[vo]", "-map", f"{n}:a", "-af", f"{vol}apad,aresample=44100", "-t", f"{total:.3f}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", str(fps),
+            "-pix_fmt", "yuv420p", "-profile:v", "high", "-color_range", "tv",
             *(["-threads", str(threads), "-filter_complex_threads", str(threads)] if threads else []),
             "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-movflags", "+faststart", str(out.resolve())]
     run(cmd, cwd=ass.parent if ass else None)

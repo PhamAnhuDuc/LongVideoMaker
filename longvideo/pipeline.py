@@ -105,7 +105,7 @@ def _scene_hash(s: Settings, sc, w, h):
              s.sub_position, s.sub_margin, s.transition, s.transition_dur, s.max_clip_sec, s.clip_mode,
              s.voice_volume, tuple(s.footage_sources), s.sub_timing)
     shots = json.dumps([x["kw"] for x in shots_for(sc)], ensure_ascii=False)
-    key = f"{sc['narration']}|{sc.get('keywords')}|{shots}|{sc.get('media')}|{s.voice}|{s.rate}|{w}x{h}|{style}"
+    key = f"v2|{sc['narration']}|{sc.get('keywords')}|{shots}|{sc.get('media')}|{s.voice}|{s.rate}|{w}x{h}|{style}"
     return hashlib.md5(key.encode()).hexdigest()
 
 
