@@ -1,0 +1,167 @@
+"""Điều phối: tạo kịch bản và render video theo project (có thể chạy tiếp khi bị ngắt)."""
+import hashlib
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from . import llm, music
+from .compose import concat_scenes, plan_segments, render_scene, scene_cues, write_ass
+from .config import PROJECTS, Settings
+from .footage import FootagePicker
+from .tts import synth
+from .util import fmt_ts, read_json, write_json
+
+
+class Project:
+    def __init__(self, name):
+        self.dir = PROJECTS / name
+        self.name = name
+        self.media = self.dir / "media"
+        self.work = self.dir / "work"
+        for d in (self.media, self.work):
+            d.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def create(topic):
+        slug = re.sub(r"[^a-z0-9]+", "-", topic.lower().encode("ascii", "ignore").decode())[:30].strip("-")
+        name = f"{time.strftime('%m%d-%H%M')}-{slug or 'video'}"
+        return Project(name)
+
+    @property
+    def data_file(self):
+        return self.dir / "project.json"
+
+    def load(self):
+        d = read_json(self.data_file, {})
+        return Settings.from_dict(d.get("settings", {})), d.get("script")
+
+    def save(self, settings: Settings, script):
+        write_json(self.data_file, {"settings": settings.to_dict(), "script": script})
+
+    @property
+    def bgm(self):
+        for ext in ("mp3", "wav", "m4a", "ogg"):
+            p = self.dir / f"bgm.{ext}"
+            if p.exists():
+                return p
+        return None
+
+    @property
+    def output(self):
+        return self.dir / "final.mp4"
+
+
+def list_projects():
+    ps = [p.name for p in PROJECTS.iterdir() if (p / "project.json").exists()]
+    return sorted(ps, reverse=True)
+
+
+def generate_script(proj: Project, progress):
+    s, _ = proj.load()
+    progress(0.02, "Đang lập dàn ý…")
+    script = llm.make_outline(s)
+    proj.save(s, script)
+    n = len(script["chapters"])
+    for i in range(n):
+        progress(0.05 + 0.93 * i / n, f"Viết chương {i+1}/{n}: {script['chapters'][i]['title']}")
+        script["chapters"][i]["scenes"] = llm.write_chapter(s, script, i)
+        proj.save(s, script)
+    words = sum(len(x["narration"].split()) for c in script["chapters"] for x in c["scenes"])
+    progress(1.0, f"Xong kịch bản: {words} từ, ước tính ~{words / 170:.0f} phút.")
+
+
+def generate_keywords(proj: Project, progress):
+    s, script = proj.load()
+    llm.make_keywords(s, script, lambda f, m: progress(f, m))
+    proj.save(s, script)
+    progress(1.0, "Đã tạo từ khóa footage.")
+
+
+def run_full(proj: Project, progress):
+    """Tạo kịch bản (nếu chưa có) rồi render — dùng cho tạo hàng loạt."""
+    _, script = proj.load()
+    if not script or not any(c["scenes"] for c in script["chapters"]):
+        generate_script(proj, lambda f, m: progress(f * 0.3, m))
+    render(proj, lambda f, m: progress(0.3 + f * 0.7, m))
+
+
+def _scene_hash(s: Settings, sc, w, h):
+    style = (s.subtitles, s.sub_font, s.sub_bold, s.sub_color, s.sub_outline_color, s.sub_size, s.sub_outline,
+             s.sub_position, s.sub_margin, s.transition, s.transition_dur, s.max_clip_sec, s.clip_mode,
+             s.voice_volume, tuple(s.footage_sources))
+    key = f"{sc['narration']}|{sc['keywords']}|{s.voice}|{s.rate}|{w}x{h}|{style}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+
+def render(proj: Project, progress):
+    s, script = proj.load()
+    if not script:
+        raise RuntimeError("Chưa có kịch bản.")
+    w, h = s.size()
+    portrait = h > w
+    picker = FootagePicker(proj.media, s.footage_sources, portrait, h if portrait else w, s.clip_mode)
+    scenes = []
+    for ci, ch in enumerate(script["chapters"]):
+        for si, sc in enumerate(ch["scenes"]):
+            scenes.append((ci, si, sc, proj.work / f"c{ci+1:02d}_s{si+1:03d}"))
+    total = len(scenes)
+
+    # Pha 1: giọng đọc (song song) + mốc thời gian từ - bỏ qua cảnh đã làm
+    def tts_hash(sc):
+        return hashlib.md5(f"{sc['narration']}{s.voice}{s.rate}{s.sub_timing}{s.whisper_model}".encode()).hexdigest()
+
+    def tts_job(item):
+        ci, si, sc, d = item
+        d.mkdir(exist_ok=True)
+        meta = read_json(d / "meta.json", {})
+        if meta.get("tts_hash") == tts_hash(sc) and (d / "voice.mp3").exists():
+            return item, meta
+        dur, cues, words = synth(sc["narration"], s.voice, s.rate, d / "voice.mp3",
+                                 s.sub_timing, s.language, s.whisper_model)
+        meta = {"tts_hash": tts_hash(sc), "dur": dur, "cues": cues, "words": words}
+        write_json(d / "meta.json", meta)
+        return item, meta
+
+    if s.sub_timing != "sentence" and s.subtitles:
+        progress(0.0, "Nạp model Whisper (lần đầu sẽ tải về, hơi lâu)…")
+        from . import align
+        align.preload(s.whisper_model)
+    metas = {}
+    with ThreadPoolExecutor(2) as ex:
+        futs = [ex.submit(tts_job, it) for it in scenes]
+        for k, f in enumerate(as_completed(futs)):
+            item, meta = f.result()
+            metas[item[3].name] = meta
+            progress(0.25 * (k + 1) / total, f"Giọng đọc {k+1}/{total}")
+
+    # Pha 2: dựng từng cảnh
+    files, starts, t = [], [], 0.0
+    ch_start = {}
+    for k, (ci, si, sc, d) in enumerate(scenes):
+        dur = metas[d.name]["dur"]
+        sdur = dur + 0.35
+        out = d / "scene.mp4"
+        hsh = _scene_hash(s, sc, w, h)
+        meta = read_json(d / "meta.json", {})
+        if not (out.exists() and meta.get("render_hash") == hsh):
+            t_eff = s.transition_dur if s.transition != "none" else 0.0
+            segs = plan_segments(sdur, picker, sc["keywords"], s.max_clip_sec, t_eff)
+            ass = None
+            if s.subtitles:
+                ass = d / "sub.ass"
+                write_ass(scene_cues(metas[d.name], portrait), ass, w, h, s)
+            render_scene(segs, d / "voice.mp3", ass, out, w, h, sdur, s)
+            meta["render_hash"] = hsh
+            write_json(d / "meta.json", meta)
+        ch_start.setdefault(ci, t)
+        files.append(out)
+        t += sdur
+        progress(0.25 + 0.70 * (k + 1) / total, f"Dựng cảnh {k+1}/{total}")
+
+    progress(0.96, "Ghép video cuối…")
+    bgm = music.pick(s.bgm_mode, s.bgm_track, proj.bgm)
+    concat_scenes(files, proj.output, bgm, s.bgm_volume, proj.work / "list.txt", t)
+    lines = [f"{fmt_ts(ch_start[i])} {script['chapters'][i]['title']}" for i in sorted(ch_start)]
+    (proj.dir / "chapters.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    progress(1.0, f"Hoàn tất! Độ dài {fmt_ts(t)}.")
